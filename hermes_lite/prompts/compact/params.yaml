@@ -1,0 +1,11 @@
+# Shorter parameter descriptions (compact style). tool: {parameter: description}
+search_files:
+  pattern: "Regex for content search, or glob (e.g. '*.py') for file search"
+  target: "'content' searches inside files, 'files' finds files by name"
+  path: "Directory or file to search"
+  file_glob: "Only these files, in content mode (e.g. '*.py')"
+  limit: "Maximum results"
+  offset: "Skip the first N results"
+  order: "File search: 'modified' = newest first"
+  output_mode: "Content mode output"
+  context: "Lines of context around each match (content mode)"

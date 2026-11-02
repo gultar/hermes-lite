@@ -1,0 +1,190 @@
+# Hermes Lite — default configuration.
+# Your own copy lives at ~/.hermes-lite/config.yaml (created on first run; values merge over these).
+
+model:
+  name: Qwen3.6-35B-A3B              # shown in the UI and in the system prompt
+  base_url: auto                     # auto = Hermes Lite's own llama-server (server.host/port below)
+  context_length: 64000              # must match server.ctx_size
+  max_tokens: 16384                  # per reply (thinking + answer)
+  # Qwen's recommended values for coding with thinking on.
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  presence_penalty: 0.0
+  thinking: true                     # Qwen3.6 thinks by default; false sends enable_thinking=false
+  # Send the model's earlier thinking back with tool results. Off keeps llama-server's prompt
+  # cache valid between your messages (much faster replies on a CPU-heavy setup).
+  replay_reasoning: false
+  # Who turns the model's <tool_call> text into tool calls. "client": Hermes Lite does, so
+  # llama-server streams every token (you see files being written live) and samples without a
+  # grammar. "server": llama-server's parser does (some builds send nothing until a call is
+  # finished). "auto": client, after checking that the server still puts the tools in the prompt.
+  tool_parsing: auto
+
+server:
+  autostart: true                    # launch llama-server in its own window at startup
+  # A llama-server Hermes Lite did not start on this port (e.g. Tiny Code Agent's on 8080, with
+  # server.port: 8080) is used as it is. /server restart: same = force-stop it and start the very
+  # same command again (its own settings); own = replace it with Hermes Lite's settings.
+  restart_external: same
+  # Sharing the GPU with another program's llama-server, one model at a time: at startup Hermes
+  # Lite stops the servers on these ports (e.g. [8080] for Tiny Code Agent) after recording exactly
+  # how they were started; quitting Hermes Lite (restore_on_exit) or /server handoff starts them
+  # again unchanged, and your next message takes the GPU back. From a terminal:
+  # hermes-lite --give-back.
+  stop_others: []
+  restore_on_exit: true
+  stop_on_exit: true                 # kill the server when Hermes Lite quits (only if we started it)
+  binary: llama-server
+  model_path: ~/models/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf
+  host: 127.0.0.1
+  port: 8091                         # Hermes Lite's own port, away from the usual 8080 that other tools
+                                     # (Tiny Code Agent, scripts) use, so their servers are never touched
+  # The known-good configuration (~20.5 tok/s with thinking). No MTP / speculative flags.
+  gpu_layers: 99                     # -ngl
+  n_cpu_moe: 38                      # --n-cpu-moe
+  ctx_size: 64000                    # -c
+  flash_attn: "on"                   # -fa
+  cache_type_k: q8_0                 # -ctk
+  cache_type_v: q8_0                 # -ctv
+  threads: 8                         # -t
+  extra_args: []                     # anything else, e.g. ["-ub", "1024"]. Leave MTP flags out.
+  # RAM safety. Loading the whole model into RAM (--load-mode none, --no-mmap, --mlock) is refused
+  # unless total RAM >= model size + ram_reserve_gib; memory-mapped loading is used instead.
+  ram_reserve_gib: 12
+  allow_preload_low_ram: false
+  # RAM budget: the model has to stay in RAM for fast prefill. The extras below only get what is
+  # left after the model file and ram_desktop_gib (your desktop and apps).
+  ram_desktop_gib: 5
+  cache_ram_mib: 512                 # llama-server's prompt cache in RAM (0 = off)
+  # Vision (screenshots): off unless you set it. A path to the mmproj file, "auto" (an
+  # mmproj*.gguf next to the model) or "none". It runs on the GPU: no RAM used, fast image reading;
+  # it takes some VRAM, so the context may be lowered to fit (your micro-batch is kept).
+  mmproj: none
+  mmproj_offload: true               # false = encoder in RAM (only if the RAM budget allows it)
+  image_max_tokens: 1024             # cap per image (Qwen sizes images dynamically)
+  # Window (Linux): "auto" picks $TERMINAL, then kitty, alacritty, foot, wezterm, ghostty, konsole.
+  # macOS and Windows: no window, the log goes to ~/.hermes-lite/logs/llama-server.log (/server shows
+  # it); on Windows, "window" opens the server in its own console window instead.
+  # "none" runs the server with no window; /server shows its log, or
+  # tail -f ~/.hermes-lite/logs/llama-server.log
+  terminal: auto
+  # Hyprland window rules for the server window, applied via `hyprctl dispatch exec`.
+  # "auto" = hidden scratchpad (workspace special:llama silent), so Hermes keeps focus;
+  # show/hide it with: hyprctl dispatch togglespecialworkspace llama
+  # Or e.g. "workspace 9 silent", or "none" to open it like any other window.
+  hyprland_rules: auto
+  health_timeout: 600                # seconds to wait for the model to load
+
+agent:
+  # Tools to switch off: left out of the tool list and of the prompt's guidance, e.g.
+  # [github, read_docs, package_info, web_extract, process_manage]. /tools shows what is on.
+  disabled_tools: []
+  # Python projects: commands use the project's .venv automatically, and the first pip install
+  # creates one (uv if installed). Poetry / Pipenv / Conda projects are left to their tool.
+  auto_venv: true
+  # Files in the desktop's Trash (~/.local/share/Trash, .Trash-1000, ~/.Trash) count as deleted: the
+  # model may not read, search, run or change anything there, and a working folder that was moved
+  # to the Trash falls back to where the session started.
+  block_trash: true
+  plan_max_steps: 20                 # /plan: after this many investigation steps, the plan is written
+  max_iterations: 150                # tool-calling rounds per user message
+  # Context. Past thinking is not sent back, so it does not count. When the prompt grows past
+  # compress_at × context (or leaves less than reply_reserve tokens for the next reply's thinking and
+  # answer), Hermes Lite first trims old tool output — file contents and command output older than
+  # the recent part, and file bodies inside old write_file/patch calls — keeping every message and
+  # every tool call (what, on which file) word for word. Only if that is not enough does the model
+  # write a checkpoint summary; work_ledger then attaches facts recorded by code (your requests word
+  # for word, files touched, last commands, the model's last message), the todo list and the plan.
+  # Before 2026-10-28: compress_at 0.5 (loop guard), no trimming, no ledger, keep_recent_tokens 12000.
+  compress_at: 0.8                   # share of the context the prompt may fill
+  reply_reserve: auto                # tokens kept free for the reply (auto: thinking budget + 2048)
+  keep_recent_tokens: auto           # recent part never trimmed or summarized (auto: 25 % of context)
+  prune_old_outputs: true            # trim old tool output before summarizing (false: summarize only)
+  keep_recent_reads: 3               # the latest read_file results stay whole, even past the recent part
+                                     # (within ~45 % of the free context; the newest always). An earlier
+                                     # read of a file and range that was read again is trimmed. 0 = off
+  work_ledger: true                  # exact facts in every compaction handoff
+  # Project notes: <project root>/PROJECT_NOTES.md, the model's memory of the project (what it is,
+  # layout, what was done, current state, next steps). Read into the system prompt at the start
+  # of every session. The first version is written after the first reply that used 3 tools; after
+  # every this-many tool calls the model adds only what changed (new 'Done so far' bullets, changed
+  # sections: ~1/4 of the writing), and rewrites the whole file once that list passes 30 bullets.
+  # /notes update now, /notes rewrite for a full rewrite. Quitting and /new never wait for them
+  # unless project_notes_on_exit is true. Only inside a project.
+  project_notes: true
+  project_notes_file: PROJECT_NOTES.md
+  project_notes_after_tool_calls: 8
+  project_notes_on_exit: false
+  project_notes_words: 900           # the full version
+  project_notes_delta_tokens: 700    # a 'what changed' update
+  approvals: smart                   # smart = ask before dangerous commands; off = never ask (yolo)
+  tool_output_chars: 20000           # terminal/web output shown to the model before head+tail truncation
+  read_chars: 60000                  # read_file per-call character budget
+  # File outlines (classes, functions, parameters, types, line ranges) at the top of read_file.
+  # Images (screenshot / view_image tools, only when the server has vision): each image is shown
+  # to the model once; after its reply the image is replaced by a text note of what it saw.
+  image_max_side: 1280               # images are scaled down to this many pixels on the long side
+  outline: auto                      # auto | always | off
+  outline_min_lines: 150             # auto: files longer than this get an outline
+  read_full_lines: 2000              # files up to this many lines are read whole (within read_chars)
+  read_head_lines: 300               # longer ones: outline + the first lines, then the model reads ranges
+  terminal_timeout: 180
+  # Memory guard: when free RAM falls under this, stop the largest process Hermes Lite started
+  # (never llama-server) instead of letting the desktop run out of memory.
+  memory_guard: true
+  memory_guard_min_free_gib: 1.5
+
+web:
+  # No API keys. "duckduckgo" scrapes DuckDuckGo's HTML endpoint.
+  # "searxng" uses a SearXNG instance at searxng_url (must have the JSON format enabled).
+  search_backend: duckduckgo
+  searxng_url: http://127.0.0.1:8888
+  # web_extract: characters of a page the model gets at once (40000 ≈ 12k tokens); a longer page
+  # comes back as its beginning plus a file to continue reading. Several URLs in one call share
+  # extract_total_chars. Old pages are trimmed from the context later, like other tool output.
+  extract_chars: 40000
+  extract_total_chars: 60000
+  # Pages built by JavaScript run in Lightpanda (a light headless browser, ~30 MB; install.sh puts it
+  # in the venv), then Chromium if that fails. auto = the venv's or PATH's; a path; or off.
+  lightpanda: auto
+
+ui:
+  show_thinking: true                # thinking blocks visible (collapsed once finished)
+  theme: hermes                      # hermes (gold on ink) | textual-dark | nord | gruvbox | ...
+  # false = the terminal owns the mouse: plain drag selects text and Ctrl+Shift+C copies it, like
+  # in any terminal. Panels then open with Tab + Enter instead of clicks. Same as --no-mouse.
+  mouse: true
+
+skills:
+  # Extra read-only skill folders, e.g. your existing Hermes skills: ["~/.hermes/skills"]
+  extra_dirs: []
+  # Hermes' skill review: after this many tool-calling rounds (counted across messages), when the
+  # model finishes its answer, Hermes Lite asks it to save or improve a skill from what it learned.
+  # The conversation is already in llama-server's cache, so only the reply costs time.
+  auto_review: true
+  review_after_tool_calls: 10
+  review_thinking: false   # thinking during the review is slower; usually not needed
+  review_max_steps: 8
+
+# Prompts: every text the model reads is a Markdown file in hermes_lite/prompts/. Your edited copies
+# live in ~/.hermes-lite/prompts/ (/prompts edit <name>). overrides: false ignores all of them at once.
+prompts:
+  overrides: true
+  # compact: shorter wording of the same rules (~2k tokens less; prompts/compact/). hermes: the
+  # original Hermes wording, exactly as before 2026-10-28 (or hermes-lite --hermes-prompts for one
+  # run; /prompts style hermes switches the current session).
+  style: compact
+
+# Thinking-loop guard (Qwen3.6 can think in circles). enabled: false = exactly the behaviour
+# before the guard (your model.temperature / presence_penalty apply again).
+loop_guard:
+  enabled: true
+  thinking_budget: 8192              # max thinking tokens per reply, enforced by llama-server (0 = none)
+  retry_budget: 2048                 # thinking budget for the resend after a loop was cut
+  detect: true                       # watch the stream; end the thinking (or resend) when it repeats
+  max_retries: 2                     # resends per message before giving up and asking you
+  presence_penalty: 0.5              # Qwen allows 0-2 against endless repetition
+  temperature: 0.7                   # loops grow at low temperatures
+  dry_multiplier: 0.0                # DRY repetition sampler (0 = off; code repeats legitimately)

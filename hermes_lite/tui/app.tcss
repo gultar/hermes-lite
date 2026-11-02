@@ -1,0 +1,146 @@
+/* Hermes Lite — lapis & bronze */
+
+Screen {
+    background: #161b29;
+    color: #e7e1d1;
+    layers: base overlay;
+}
+
+HeaderBar {
+    height: 1;
+    background: #1f2638;
+    padding: 0 0;
+}
+
+#main {
+    height: 1fr;
+}
+
+#log {
+    width: 1fr;
+    padding: 1 3 0 3;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: #3a4360;
+    scrollbar-color-hover: #c8a04a;
+    scrollbar-background: #161b29;
+}
+
+Sidebar {
+    width: 34;
+    background: #1b2131;
+    border-left: vkey #2b3349;
+    padding: 1 2;
+}
+Sidebar.hidden { display: none; }
+.side-title { color: #c8a04a; text-style: bold; margin-top: 1; }
+.side-title:first-of-type { margin-top: 0; }
+.side-body { color: #c9c3b4; margin-bottom: 1; }
+
+/* ── messages ─────────────────────────────── */
+UserMessage {
+    margin: 1 0 1 0;
+    padding: 0 1;
+    border-left: outer #c8a04a;
+    color: #f1ecdf;
+    text-style: bold;
+}
+UserMessage.steer { border-left: outer #8c90b8; color: #c9c3b4; text-style: italic; }
+UserMessage.notification { border-left: outer #6fb5a0; color: #a9c9bd; text-style: none; }
+
+AssistantMessage {
+    margin: 1 0 1 0;
+    padding: 0 0;
+    background: transparent;
+}
+AssistantMessage > MarkdownFence { margin: 1 0; max-height: 40; }
+
+SystemLine { color: #7d8399; margin: 0 0 1 0; }
+SystemLine.error { color: #d0705f; }
+SystemLine.ok { color: #6fb5a0; }
+SystemLine.help { color: #c9c3b4; }
+
+/* collapsibles: thinking + tools share a quiet, borderless look */
+Collapsible {
+    border: none;
+    background: transparent;
+    padding: 0;
+    margin: 0;
+}
+Collapsible > CollapsibleTitle {
+    padding: 0 0;
+    background: transparent;
+}
+Collapsible > CollapsibleTitle:hover { background: #222a3e; }
+Collapsible > CollapsibleTitle:focus { background: #273047; }
+Collapsible > Contents { padding: 0 0 0 2; }
+
+.thinking { margin: 1 0 1 0; }
+.thinking > CollapsibleTitle { color: #8c90b8; text-style: italic; }
+.thinking-body { color: #8c90b8; text-style: italic; max-height: 24; overflow-y: auto; }
+
+.tool > CollapsibleTitle { color: #a7aec4; }
+.tool.ok > CollapsibleTitle { color: #6fb5a0; }
+.tool.failed > CollapsibleTitle { color: #d0705f; }
+.tool.draft > CollapsibleTitle { color: #c8a04a; }
+.tool-body {
+    color: #b9b4a6;
+    background: #1b2131;
+    padding: 0 1;
+    max-height: 30;
+    overflow-y: auto;
+}
+
+/* ── input ─────────────────────────────── */
+#input-row {
+    height: auto;
+    max-height: 12;
+    padding: 0 2 0 2;
+    background: #1f2638;
+    border-top: tall #2b3349;
+}
+#prompt-mark { width: 2; color: #c8a04a; padding: 1 0 0 0; text-style: bold; }
+PromptInput {
+    height: auto;
+    min-height: 3;
+    max-height: 10;
+    background: #1f2638;
+    border: none;
+    padding: 1 0 0 0;
+}
+PromptInput:focus { border: none; }
+PromptInput .text-area--cursor-line { background: #1f2638; }
+
+#hint {
+    height: 1;
+    background: #1f2638;
+    color: #5f6680;
+    padding: 0 3;
+}
+
+/* ── dialogs ─────────────────────────────── */
+ModalScreen { align: center middle; background: #0d1018 70%; }
+.dialog {
+    width: 90;
+    max-width: 95%;
+    height: auto;
+    max-height: 85%;
+    background: #1f2638;
+    border: round #c8a04a;
+    padding: 1 2;
+}
+.dialog-title { color: #c8a04a; text-style: bold; margin-bottom: 1; }
+.dialog-code { background: #161b29; color: #f1ecdf; padding: 1 2; margin-bottom: 1; }
+.dialog-buttons { height: auto; margin-top: 1; }
+.dialog-buttons Button { margin-right: 2; }
+.clarify-scroll { height: auto; max-height: 30; }
+.clarify-q { color: #f1ecdf; margin-top: 1; }
+.clarify OptionList, .clarify SelectionList { height: auto; max-height: 10; background: #161b29; }
+.clarify Input { background: #161b29; }
+.sessions OptionList { height: auto; max-height: 24; background: #161b29; }
+.muted { color: #7d8399; }
+
+/* approval: the command scrolls, the buttons never leave the screen */
+.approval { height: auto; max-height: 90%; }
+.dialog-code-scroll { height: auto; max-height: 60vh; margin-bottom: 1; }
+.dialog-code-scroll .dialog-code { margin-bottom: 0; }
+.dialog-keys { color: #7d8399; }

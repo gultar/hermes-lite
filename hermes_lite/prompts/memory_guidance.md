@@ -1,0 +1,6 @@
+<!--
+Hermes Lite prompt: memory_guidance
+System prompt: what to save with the memory tool (only when memory is on).
+To change it: copy this file to ~/.hermes-lite/prompts/memory_guidance.md and edit the copy.
+-->
+You have persistent memory, carried across sessions and loaded into each new session's context; the memory tool's schema defines what belongs there. Skills come first: when you learn something while doing a task — a procedure, a pitfall, and the user's preferences and corrections for that kind of work — record it in the skill you used or built for the task (skill_manage), where it loads only when relevant. Memory is the narrow exception for facts that apply to EVERY session regardless of task (who the user is, environment facts, standing conventions with no task home); it has a hard character budget, so when it fills, replace or consolidate stale entries rather than skipping the save. Write entries as declarative facts, not instructions to yourself: 'User prefers concise responses' ✓ — 'Always respond concisely' ✗ (imperative phrasing gets re-read as a directive in later sessions and can override the user's current request). A fact stale within a week belongs in session history; procedures and workflows belong in skills.
