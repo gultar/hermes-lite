@@ -22,7 +22,6 @@ server:
   binary: llama-server
   n_cpu_moe: 38
   terminal: auto           # "none" = no server window (log: /server, or ~/.hermes-lite/logs/llama-server.log)
-  hyprland_rules: auto     # server window on a hidden scratchpad; toggle: hyprctl dispatch togglespecialworkspace llama
   extra_args: []
 """
 
@@ -68,6 +67,9 @@ def load_config(path: str | None = None) -> Config:
     if user_path.exists():
         user = yaml.safe_load(user_path.read_text(encoding="utf-8")) or {}
     cfg = Config(_merge(defaults, user))
+    srv_user = user.get("server") if isinstance(user, dict) else None
+    if isinstance(srv_user, dict) and "mmproj_offload" in srv_user and "mmproj_device" not in srv_user:
+        cfg["server"]["mmproj_device"] = "vram" if srv_user["mmproj_offload"] else "ram"  # older setting
     cfg["_path"] = str(user_path)
     model, server = cfg.setdefault("model", {}), cfg.setdefault("server", {})
     if str(model.get("base_url") or "auto").strip().lower() == "auto":

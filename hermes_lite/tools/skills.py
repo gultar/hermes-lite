@@ -102,10 +102,24 @@ def skill_manage(args: dict, ctx: ToolContext) -> str:
     return ok(success=True, results=results)
 
 
+def slug(text: str) -> str:
+    """'Static Web App (HTMX)' -> 'static-web-app-htmx': a valid skill name, or '' if nothing is left."""
+    return re.sub(r"[^a-z0-9_]+", "-", str(text).strip().lower()).strip("-_")[:64].rstrip("-_")
+
+
 def _one(op: dict, ctx: ToolContext) -> str:
-    action, name = op.get("action"), str(op.get("name") or "")
+    action = str(op.get("action") or "").strip().lower()
+    given = str(op.get("name") or "").strip()
+    name = given
+    if not name and action == "create" and op.get("content"):
+        # small models often put the name only in the SKILL.md frontmatter
+        name = str(parse_frontmatter(str(op["content"]))[0].get("name") or "")
+    name = name if NAME_RE.match(name) else slug(name)
     if not NAME_RE.match(name):
-        return "ERR:'name' must be lowercase letters, digits, hyphens/underscores (max 64 chars)."
+        known = ", ".join(sorted(catalog(ctx))[:20]) or "none yet"
+        return (f"ERR:{'name is missing' if not given else f'{given!r} is not a usable skill name'}: pass "
+                "name='lowercase-with-hyphens' (letters, digits, - or _; max 64) as its own argument, next to "
+                f"action{' and content' if action == 'create' else ''}. Existing skills: {known}.")
     info = catalog(ctx).get(name)
     if action == "create":
         if info:
@@ -115,6 +129,10 @@ def _one(op: dict, ctx: ToolContext) -> str:
             return "ERR:'create' needs content: the full SKILL.md (YAML frontmatter with name + description, then markdown)."
         if not content.lstrip().startswith("---"):
             content = f"---\nname: {name}\ndescription: {short(content, 120)}\n---\n\n{content}"
+        elif str(parse_frontmatter(content)[0].get("name") or "") != name:   # keep the frontmatter in step
+            content = re.sub(r"^(---\s*\n(?:.*\n)*?)name:[^\n]*\n", lambda m: f"{m.group(1)}name: {name}\n",
+                             content.lstrip(), count=1) if re.search(r"^name:", content, re.M) else \
+                content.lstrip().replace("---\n", f"---\nname: {name}\n", 1)
         folder = ctx.home / "skills" / (op.get("category") or "") / name
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "SKILL.md").write_text(content, encoding="utf-8")
@@ -195,7 +213,7 @@ register(Tool(
             "file_path": {"type": "string", "description": "Supporting file path inside the skill (e.g. references/notes.md)."},
             "file_content": {"type": "string", "description": "write_file: full text of the supporting file."},
             "operations": {"type": "array", "description": "Several ops, each with the same fields as above.", "items": {"type": "object"}},
-        }}},
+        }, "required": ["action"]}},
     handler=skill_manage,
     label=lambda a: f"{a.get('action', '')} {a.get('name', '')}".strip() or f"{len(a.get('operations') or [])} ops",
 ))

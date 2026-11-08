@@ -1,0 +1,7 @@
+<!doctype html><html><head><meta charset="utf-8"><title>App</title></head><body><div id="root"></div>
+<script>
+const root = document.getElementById('root');
+root.innerHTML = '<h2>Todo app</h2><ul id="l"></ul><input id="t" placeholder="New item"><button id="add">Add</button>';
+document.getElementById('add').onclick = () => { const li = document.createElement('li');
+  li.textContent = document.getElementById('t').value || '(empty)'; document.getElementById('l').appendChild(li); };
+</script></body></html>

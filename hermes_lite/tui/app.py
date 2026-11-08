@@ -21,7 +21,7 @@ from ..llm import ToolCall
 from ..server import LlamaServer, build_command
 from ..tools import REGISTRY
 from ..tools.skills import catalog
-from .screens import ApprovalScreen, ClarifyScreen, SecretScreen, SessionScreen
+from .screens import ApprovalScreen, ClarifyScreen, SecretScreen, SessionScreen, SkillBrowser
 from .widgets import (AssistantMessage, DraftCard, HeaderBar, PromptInput, Sidebar, SystemLine, ThinkingBlock, ToolCard,
                       UserMessage)
 
@@ -39,8 +39,10 @@ HELP = """Commands
   /compress         compact the context now            /usage         context and speed
   /cwd <dir>        change the working directory       /think on|off  model thinking
   /yolo             toggle command approvals           /memory        show memory + user profile
-  /skills           list skills                        /tools         list tools
+  /skills           list skills  · /skills browse: pick from a catalogue   /tools  list tools
   /server [restart|reset] status / restart / retry your own settings      /quit          exit
+  /vision [ram|vram|off]  vision encoder (screenshots): where it runs, or off; restarts llama-server
+  /telegram [on|off|setup|forget]  use this session from Telegram too (status without an argument)
   /server handoff   give the GPU back to the server(s) it stopped (server.stop_others); your next message takes it back
   /forget-password  drop a sudo password you chose to remember
   /stream           what llama-server has sent for the current reply (raw; also tail -f ~/.hermes-lite/logs/stream.log)
@@ -71,11 +73,16 @@ class HermesApp(App):
         Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
     ]
 
-    def __init__(self, cfg: Config, cwd: str, start_server: bool = True, resume: Optional[str] = None):
+    def __init__(self, cfg: Config, cwd: str, start_server: bool = True, resume: Optional[str] = None,
+                 telegram: bool = False, headless: bool = False):
         super().__init__()
         self.cfg = cfg
         self.server = LlamaServer(cfg)
         self.start_server = start_server
+        self.telegram = None                 # the Telegram bridge while /telegram is on
+        self.telegram_at_start = telegram
+        self.headless = headless             # hermes-lite --telegram: no TUI, Telegram only
+        self._remote_run = False             # the request running now came from Telegram
         self.agent = Agent(cfg, self, cwd=cwd)
         self.resume_id = resume
         self.server_ready = asyncio.Event()
@@ -131,6 +138,16 @@ class HermesApp(App):
             self._line("⚠ " + w, "error")
         self._refresh_header()
         self._refresh_sidebar()
+        if self.telegram_at_start or self.cfg.get_path("telegram.auto_on", False):
+            self.run_worker(self._telegram_on(quiet_if_unset=not self.telegram_at_start), group="telegram")
+        if self.headless:
+            import signal
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, lambda: self.run_worker(self.action_quit(), group="quit"))
+                except (NotImplementedError, RuntimeError):
+                    pass
         if self.resume_id:
             data = load_session(self.resume_id)
             if data:
@@ -162,6 +179,9 @@ class HermesApp(App):
 
     def _line(self, text: str, tone: str = "info") -> None:
         self._mount(SystemLine(text, tone))
+        if self.headless:   # no screen: the terminal that started it shows these lines
+            import sys
+            print(("⚠ " if tone == "error" else "") + text, file=sys.__stdout__, flush=True)
 
     def _hint(self, text: str) -> None:
         self.status_text = text
@@ -353,8 +373,8 @@ class HermesApp(App):
             elif state == "tuning":
                 if detail:
                     self._hint(detail)
-                    if "trying safer" in detail:
-                        self._line(f"llama-server: {detail}.")
+                    if "trying" in detail and "less context" in detail:
+                        self._hint(f"llama-server: {detail}…")  # one hint, not a line per 1k step
             elif state == "ready":
                 self._hint("Model ready · Enter to send · select text to copy · Esc interrupts · /help")
                 if not detail.startswith(("already running", "restarted")):
@@ -367,10 +387,15 @@ class HermesApp(App):
                 self._line(f"llama-server: {detail}\nConfig: {self.cfg['_path']}", "error")
 
         from ..server import RAM_WARNINGS
-        for w in RAM_WARNINGS:
-            self._line(w, "error")
-        RAM_WARNINGS.clear()
-        if await self.server.ensure(on_status, warmup_body=self._warmup_body()):
+
+        def flush_warnings() -> None:
+            for w in RAM_WARNINGS:
+                self._line(w, "error")
+            RAM_WARNINGS.clear()
+        flush_warnings()
+        ok = await self.server.ensure(on_status, warmup_body=self._warmup_body())
+        flush_warnings()   # the ones found while building the command
+        if ok:
             self.server_ready.set()
             running = await self.server.served_model()
             self.served_model = Path(running).stem if running else ""
@@ -395,6 +420,8 @@ class HermesApp(App):
         handler = getattr(self, f"_ev_{kind}", None)
         if handler:
             handler(**data)
+        if self.telegram and self.telegram.active:
+            self._telegram_event(kind, data)
 
     def _ev_assistant_start(self) -> None:
         self._orphan_warned, self._orphan_polls = False, 0
@@ -614,12 +641,38 @@ class HermesApp(App):
             self.agent.steer_queue.clear()
             self._start_run(text)
 
+    def _close_screen(self, screen, value) -> None:
+        """Answered on the phone: close the same question at the computer."""
+        try:
+            if screen.is_attached and self.screen is screen:
+                screen.dismiss(value)
+        except Exception:
+            pass
+
     async def approve(self, command: str, reason: str) -> str:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self.push_screen(ApprovalScreen(command, reason), lambda v: fut.done() or fut.set_result(v or "deny"))
-        return await fut
+        screen = ApprovalScreen(command, reason)
+        self.push_screen(screen, lambda v: fut.done() or fut.set_result(v or "deny"))
+        msg = None
+        if self.telegram and self.telegram.active:
+            try:
+                msg = await self.telegram.ask_approval(command, reason, fut)
+            except Exception as exc:
+                self._line(f"Telegram: could not send the approval ({exc}).", "error")
+        verdict = await fut
+        self._close_screen(screen, verdict)
+        if msg is not None and self.telegram:
+            await self.telegram.close_approval(msg, verdict)
+        return verdict
 
     async def ask_secret(self, prompt: str, command: str) -> tuple:
+        if self.telegram and self.telegram.active and (self._remote_run or self.headless):
+            # a sudo password is never asked for through the chat
+            await self.telegram.send("🔒 This command needs your sudo password, which is only ever typed at the "
+                                     f"computer, so it was refused:\n{command[:500]}")
+            return None, False
+        if self.telegram and self.telegram.active:
+            await self.telegram.send("🔒 Waiting for your sudo password at the computer (it is never asked for here).")
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self.push_screen(SecretScreen(prompt, command),
                          lambda v: fut.done() or fut.set_result(v if v else (None, False)))
@@ -627,8 +680,20 @@ class HermesApp(App):
 
     async def clarify(self, questions: list) -> list:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self.push_screen(ClarifyScreen(questions), lambda v: fut.done() or fut.set_result(v or []))
-        return await fut
+        screen = ClarifyScreen(questions)
+        self.push_screen(screen, lambda v: fut.done() or fut.set_result(v or []))
+        answer = None
+        if self.telegram and self.telegram.active:
+            from ..telegram import format_questions, parse_answers
+            await self.telegram.send(format_questions(questions))
+            answer = self.telegram.expect_answer()
+            answer.add_done_callback(lambda f: None if f.cancelled() or fut.done()
+                                     else fut.set_result(parse_answers(f.result(), questions)))
+        result = await fut
+        self._close_screen(screen, result)
+        if answer is not None and not answer.done():
+            answer.cancel()
+        return result
 
     # ── running ─────────────────────────────────────────────────────────
     def _start_run(self, text: str, synthetic: bool = False) -> None:
@@ -658,10 +723,13 @@ class HermesApp(App):
             self._mount(UserMessage(text))
             self.agent.interrupt()
             return
+        if self.telegram and self.telegram.active:
+            asyncio.create_task(self.telegram.send("🖥 " + text[:1500]))
         if self.agent.busy:
             self.agent.steer(text)
             self._mount(UserMessage(text, "steer"))
             return
+        self._remote_run = False
         self._mount(UserMessage(text))
         self._start_run(text)
 
@@ -679,6 +747,236 @@ class HermesApp(App):
                     card.collapsed = False
             self._hint("Enter to send · Shift+Enter newline · select text to copy · Esc interrupts · /help")
         self.run_worker(go(), group="shell")
+
+    def _browse_skills(self) -> None:
+        from .. import skillcatalog as sc
+        home = self.agent.home
+        items = sc.entries(self.cfg, home)
+        if not items:
+            self._line("No catalogue found. It reads " + ", ".join(sc.DEFAULT_SOURCES) + " — or set skills.catalog "
+                       "to folders of skills, e.g. a clone of Hermes Agent: skills.catalog: [~/src/hermes-agent/"
+                       "optional-skills]", "help")
+            return
+
+        def toggle(e: dict) -> str:
+            try:
+                if e["removable"]:
+                    sc.remove(e["name"], home)
+                    e["added"] = e["removable"] = False
+                    return f"Removed {e['name']}."
+                if e["added"]:
+                    return f"{e['name']} is already one of your skills (not added from here, so not removed here)."
+                dest = sc.add(e, home)
+                e["added"] = e["removable"] = True
+                return f"Added {e['name']} → {dest}"
+            except OSError as exc:
+                return f"{e['name']}: {exc}"
+
+        def done(changes: list | None) -> None:
+            changes = [c for c in (changes or []) if c.startswith(("Added", "Removed"))]
+            if changes:
+                self._reload_prompts()   # the skill list is part of the system prompt
+                self._line("\n".join(changes) + "\nThe model sees the new skill list from your next message.", "ok")
+        self.push_screen(SkillBrowser(items, toggle), done)
+
+    # ── Telegram ────────────────────────────────────────────────────────
+    async def _telegram_command(self, arg: str) -> None:
+        from .. import telegram as tg
+        sub = (arg.split() or ["status"])[0].lower()
+        home = self.agent.home
+        if sub == "setup":
+            await self._telegram_setup()
+        elif sub in ("on", "start"):
+            await self._telegram_on()
+        elif sub in ("off", "stop"):
+            await self._telegram_off()
+        elif sub == "forget":
+            await self._telegram_off(quiet=True)
+            state = tg.load_state(home)
+            for k in ("owner_id", "chat_id"):
+                state.pop(k, None)
+            tg.save_state(home, state)
+            self._line("Telegram: unpaired. /telegram on shows a new pairing code.", "ok")
+        else:
+            st = tg.load_state(home)
+            on = bool(self.telegram and self.telegram.active)
+            self._line(f"Telegram: {'on' if on else 'off'}"
+                       + (f" (@{self.telegram.username})" if on else "")
+                       + f" · token {'set' if tg.token(home) else 'not set'}"
+                       + f" · {'paired' if st.get('owner_id') else 'not paired'}\n"
+                       "/telegram setup (bot token from @BotFather) · /telegram on · /telegram off · "
+                       "/telegram forget (pair another account)", "help")
+
+    async def _telegram_setup(self) -> bool:
+        from .. import telegram as tg
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.push_screen(SecretScreen("Telegram bot token", "Create a bot with @BotFather in Telegram (/newbot); "
+                                      "it gives you a token like 123456789:AA…", placeholder="Bot token (hidden)",
+                                      remember="", send="Save"),
+                         lambda v: fut.done() or fut.set_result(v if v else (None, False)))
+        value, _ = await fut
+        value = (value or "").strip()
+        if not value:
+            return False
+        if not tg.TOKEN_RE.match(value):
+            self._line("That does not look like a bot token (digits, a colon, then ~35 characters).", "error")
+            return False
+        tg.save_state(self.agent.home, {**tg.load_state(self.agent.home), "token": value})
+        self._line(f"Telegram bot token saved in {tg.state_path(self.agent.home)} (readable only by you).", "ok")
+        return True
+
+    async def _telegram_on(self, quiet_if_unset: bool = False) -> None:
+        from .. import telegram as tg
+        if self.telegram and self.telegram.active:
+            self._line(f"Telegram is already on (@{self.telegram.username}).", "help")
+            return
+        home = self.agent.home
+        if not tg.token(home):
+            if quiet_if_unset or self.headless or not await self._telegram_setup():
+                if self.headless:
+                    self._line("No Telegram bot token: run hermes-lite --telegram in a terminal to set one.", "error")
+                    self.exit()
+                return
+        bridge = tg.Bridge(home, self._remote_message, self._remote_command, self._line)
+        try:
+            name = await bridge.start()
+        except Exception as exc:
+            await bridge.client.aclose()
+            self._line(f"Telegram did not start: {exc}", "error")
+            if self.headless:
+                self.exit()
+            return
+        self.telegram = bridge
+        if bridge.owner:
+            self._line(f"📱 Telegram on: @{name} talks to this session (/telegram off stops it).", "ok")
+        else:
+            self._line(f"📱 Telegram on. To pair your account, send this code to @{name}: {bridge.pair_code}\n"
+                       "Only that account will be answered.", "ok")
+
+    async def _telegram_off(self, quiet: bool = False) -> None:
+        if self.telegram:
+            await self.telegram.stop()
+            self.telegram = None
+            if not quiet:
+                self._line("📱 Telegram off.", "ok")
+        elif not quiet:
+            self._line("Telegram is not on.", "help")
+
+    async def _remote_message(self, text: str) -> None:
+        self._mount(UserMessage("📱 " + text))
+        if self.agent.busy:
+            self.agent.steer(text)
+            await self.telegram.send("↪ Got it: the agent reads it after its current step.")
+            return
+        self._remote_run = True
+        self._start_run(text)
+
+    async def _remote_command(self, cmd: str) -> str:
+        if cmd in ("help", "start"):
+            return ("Write to me as you would in Hermes Lite: your message goes to this session.\n"
+                    "/stop  interrupt what it is doing\n/status  what it is doing, context used, folder\n"
+                    "/new  start a new session\nCommand approvals come as buttons. A sudo password is never "
+                    "asked for here.")
+        if cmd in ("stop", "esc", "cancel"):
+            if self.agent.busy:
+                self.agent.interrupt()
+                return "⏹ Interrupting."
+            return "Nothing is running."
+        if cmd == "status":
+            used, total = self.agent.context_usage()
+            return (f"{'⏳ working' if self.agent.busy else '💤 idle'} · context {used // 1000}k/{total // 1000}k · "
+                    f"{self.agent.ctx.cwd} · llama-server {self.server.status}")
+        if cmd == "new":
+            await self.action_new_session()
+            return "🆕 New session."
+        return f"Unknown command /{cmd}. /help"
+
+    def _telegram_event(self, kind: str, data: dict) -> None:
+        tg = self.telegram
+
+        def spawn(coro) -> None:
+            async def safe():
+                try:
+                    await coro
+                except Exception as exc:
+                    self._line(f"Telegram: {exc}", "error")
+            asyncio.create_task(safe())
+        if kind == "assistant_start":
+            tg.typing(True)
+        elif kind == "tool_start":
+            spawn(tg.progress(f"{data.get('emoji', '🔧')} {data.get('name')}: {str(data.get('label') or '')[:120]}"))
+        elif kind == "final" and str(data.get("text") or "").strip():
+            spawn(tg.send(data["text"], markdown=True))
+        elif kind == "error":
+            spawn(tg.send("⚠ " + str(data.get("text") or "")[:1500]))
+        elif kind == "interrupted":
+            spawn(tg.send("Interrupted."))
+        elif kind == "images_attached":
+            last = self.agent.messages[-1] if self.agent.messages else {}
+            for path in last.get("_images") or []:
+                spawn(tg.send_photo(path, data.get("labels", "")))
+        elif kind == "idle":
+            tg.typing(False)
+            spawn(tg.progress_done("✓ done"))
+
+    async def _vision(self, arg: str) -> None:
+        """/vision: show where the vision encoder runs; /vision ram|vram|off: change it and restart."""
+        from ..config import set_value
+        from ..server import find_mmproj, ram_budget, ram_plan, vision_device
+        s = self.cfg["server"]
+        if arg not in ("ram", "vram", "gpu", "cpu", "off", "none"):
+            mm = find_mmproj(self.cfg)
+            where = ("off (server.mmproj: none)" if str(s.get("mmproj", "none")).lower() in ("none", "off", "")
+                     else f"set, but no file found (server.mmproj: {s.get('mmproj')})" if not mm
+                     else f"{mm.name} in {'VRAM (GPU)' if ram_plan(self.cfg)[2] else 'RAM (CPU)'}")
+            b = ram_budget(self.cfg)
+            ram = (f"RAM: {b['total'] / 2**30:.1f} GB = your apps {b['apps'] / 2**30:.1f} + model "
+                   f"{b['model'] / 2**30:.1f} + {max(b['spare'], 0) / 2**30:.1f} left for the encoder and prompt "
+                   "cache (the model counts as \"cache\" in system monitors, not \"used\")\n") if b else ""
+            self._line(f"Vision encoder: {where}\nServer sees images: "
+                       f"{ {True: 'yes', False: 'no', None: 'not checked yet'}[self.agent.llm.vision] }\n{ram}"
+                       "/vision ram   on the CPU: no VRAM used, context untouched, slower image reading\n"
+                       "/vision vram  on the GPU: fast, but ~0.9 GB of VRAM, so the context may be lowered\n"
+                       "/vision off   no encoder (screenshot and view_image are left out)", "help")
+            return
+        device = {"gpu": "vram", "cpu": "ram", "none": "off"}.get(arg, arg)
+        path = Path(self.cfg.get("_path") or "")
+        changes: dict[str, str] = {}
+        if device == "off":
+            changes["mmproj"] = "none"
+        else:
+            changes["mmproj_device"] = device
+            if str(s.get("mmproj", "none")).lower() in ("none", "off", ""):
+                changes["mmproj"] = "auto"
+                if not find_mmproj(Config({**self.cfg, "server": {**s, "mmproj": "auto"}})):
+                    self._line("No vision encoder (mmproj*.gguf) next to the model. Download the one made for "
+                               "your model, then: hermes-lite --set server.mmproj=/path/to/mmproj-F16.gguf", "error")
+                    return
+        try:
+            from ..rollback import snapshot_config
+            snapshot_config(path)  # so `hermes-lite --rollback config` undoes it
+            for k, v in changes.items():
+                set_value(path, f"server.{k}", v)
+                s[k] = v
+        except (OSError, ValueError) as e:
+            self._line(f"Could not change {path}: {e}", "error")
+            return
+        self._line(f"Vision {'off' if device == 'off' else 'encoder in ' + device.upper()} "
+                   f"({', '.join(f'server.{k}: {v}' for k, v in changes.items())}). Undo: hermes-lite --rollback config",
+                   "ok")
+        if not self.start_server:
+            self._line("Started with --no-server: restart your llama-server yourself to apply it.", "help")
+            return
+        if self.agent.busy:
+            self.agent.interrupt()
+
+        async def again():
+            self.server_ready.clear()
+            self._hint("Stopping llama-server…")
+            await self.server.stop_any()
+            self._line("Restarting llama-server with the new vision setting…")
+            await self._boot_server()
+        self.run_worker(again(), group="server")
 
     # ── slash commands ──────────────────────────────────────────────────
     async def _command(self, line: str) -> None:
@@ -892,10 +1190,13 @@ class HermesApp(App):
         elif cmd == "memory":
             m = self.agent.memory
             self._line((m.block("memory") or "Memory is empty.") + "\n\n" + (m.block("user") or "User profile is empty."), "help")
+        elif cmd == "skills" and arg.lower() in ("browse", "catalog", "catalogue", "add"):
+            self._browse_skills()
         elif cmd == "skills":
             cat = catalog(self.agent.ctx)
-            self._line("\n".join(f"{n}  —  {i['description']}" for n, i in sorted(cat.items()))
-                       or f"No skills yet. They live in {self.agent.home / 'skills'}.", "help")
+            self._line(("\n".join(f"{n}  —  {i['description']}" for n, i in sorted(cat.items()))
+                        or f"No skills yet. They live in {self.agent.home / 'skills'}.")
+                       + "\n\n/skills browse: pick skills from a catalogue (Hermes Agent's, or skills.catalog).", "help")
         elif cmd == "tools":
             from ..tools.base import disabled_tools
             off = disabled_tools(self.cfg)
@@ -906,6 +1207,11 @@ class HermesApp(App):
                 rows.append(f"{t.emoji} {t.name:16} {state}")
             self._line("\n".join(rows) + "\n\nTurn tools off in config.yaml: agent.disabled_tools: [github, read_docs]"
                        " — they are then left out of the prompt entirely.", "help")
+        elif cmd == "vision":
+            await self._vision(arg.lower())
+        elif cmd == "telegram":
+            # a worker: it may open the token box, which needs this input handler to be free
+            self.run_worker(self._telegram_command(arg), group="telegram")
         elif cmd == "server" and arg in ("handoff", "give", "release"):
             async def hand():
                 if self.agent.busy:
@@ -1187,6 +1493,9 @@ class HermesApp(App):
         self._refresh_header()
 
     async def action_quit(self) -> None:
+        if self.telegram:
+            await self.telegram.stop("⚪ Hermes Lite quit.")
+            self.telegram = None
         if getattr(self, "memguard", None):
             self.memguard.stop()
         if self.agent.busy:

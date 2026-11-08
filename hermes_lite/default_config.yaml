@@ -54,27 +54,28 @@ server:
   # unless total RAM >= model size + ram_reserve_gib; memory-mapped loading is used instead.
   ram_reserve_gib: 12
   allow_preload_low_ram: false
-  # RAM budget: the model has to stay in RAM for fast prefill. The extras below only get what is
-  # left after the model file and ram_desktop_gib (your desktop and apps).
+  # RAM budget: the model has to stay in RAM for fast prefill. The extras below (prompt cache, a
+  # vision encoder in RAM) only get what is left after the model and your apps, measured at each
+  # server start; ram_desktop_gib is the least counted for your apps.
   ram_desktop_gib: 5
   cache_ram_mib: 512                 # llama-server's prompt cache in RAM (0 = off)
   # Vision (screenshots): off unless you set it. A path to the mmproj file, "auto" (an
-  # mmproj*.gguf next to the model) or "none". It runs on the GPU: no RAM used, fast image reading;
-  # it takes some VRAM, so the context may be lowered to fit (your micro-batch is kept).
+  # mmproj*.gguf next to the model) or "none". /vision ram|vram|off switches it from the TUI.
   mmproj: none
-  mmproj_offload: true               # false = encoder in RAM (only if the RAM budget allows it)
+  # Where the vision encoder runs:
+  #   vram  on the GPU: fast image reading, but it takes VRAM (~0.9 GB at F16), so the context
+  #         may be lowered to fit (your micro-batch is kept)
+  #   ram   on the CPU: no VRAM used, context untouched; images take a few seconds longer to read
+  mmproj_device: vram
   image_max_tokens: 1024             # cap per image (Qwen sizes images dynamically)
   # Window (Linux): "auto" picks $TERMINAL, then kitty, alacritty, foot, wezterm, ghostty, konsole.
   # macOS and Windows: no window, the log goes to ~/.hermes-lite/logs/llama-server.log (/server shows
   # it); on Windows, "window" opens the server in its own console window instead.
   # "none" runs the server with no window; /server shows its log, or
   # tail -f ~/.hermes-lite/logs/llama-server.log
+  # kitty, alacritty, foot and wezterm open it with the class / app id "hermes-lite-server":
+  # place it with your window manager's rules.
   terminal: auto
-  # Hyprland window rules for the server window, applied via `hyprctl dispatch exec`.
-  # "auto" = hidden scratchpad (workspace special:llama silent), so Hermes keeps focus;
-  # show/hide it with: hyprctl dispatch togglespecialworkspace llama
-  # Or e.g. "workspace 9 silent", or "none" to open it like any other window.
-  hyprland_rules: auto
   health_timeout: 600                # seconds to wait for the model to load
 
 agent:
@@ -149,6 +150,10 @@ web:
   # Pages built by JavaScript run in Lightpanda (a light headless browser, ~30 MB; install.sh puts it
   # in the venv), then Chromium if that fails. auto = the venv's or PATH's; a path; or off.
   lightpanda: auto
+  # The browser tool (click, type, forms, a page that stays open): Lightpanda first, Chromium (a
+  # throwaway profile) when Lightpanda cannot handle a page. auto | lightpanda | chromium.
+  browser: auto
+  browser_idle_minutes: 10           # an idle browser is closed (Chromium holds hundreds of MB)
 
 ui:
   show_thinking: true                # thinking blocks visible (collapsed once finished)
@@ -159,7 +164,11 @@ ui:
 
 skills:
   # Extra read-only skill folders, e.g. your existing Hermes skills: ["~/.hermes/skills"]
+  # (every skill in them goes into the prompt: /skills browse adds only the ones you pick)
   extra_dirs: []
+  # Folders that /skills browse lists. Default: ~/.hermes/skills and, if Hermes Agent's code is in
+  # ~/.hermes/hermes-agent, its skills and optional-skills.
+  # catalog: [~/.hermes/skills, ~/src/hermes-agent/optional-skills]
   # Hermes' skill review: after this many tool-calling rounds (counted across messages), when the
   # model finishes its answer, Hermes Lite asks it to save or improve a skill from what it learned.
   # The conversation is already in llama-server's cache, so only the reply costs time.
@@ -188,3 +197,9 @@ loop_guard:
   presence_penalty: 0.5              # Qwen allows 0-2 against endless repetition
   temperature: 0.7                   # loops grow at low temperatures
   dry_multiplier: 0.0                # DRY repetition sampler (0 = off; code repeats legitimately)
+
+# Telegram: use the running session from your phone (/telegram on), or run with no TUI
+# (hermes-lite --telegram). /telegram setup saves the bot token from @BotFather; the first
+# /telegram on shows a pairing code: only the account that sends it is ever answered.
+telegram:
+  auto_on: false           # turn it on whenever Hermes Lite starts (once a token is set)

@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Feed</title></head><body>
+<ul id="feed"></ul><div id="sentinel" style="height:10px"></div>
+<script>
+let n = 0; const feed = document.getElementById('feed');
+const more = () => { for (let i = 0; i < 20; i++) { const li = document.createElement('li'); li.style.height = '60px';
+  li.textContent = 'Post ' + (++n); feed.appendChild(li); } };
+more();
+if ('IntersectionObserver' in window) {
+  new IntersectionObserver(es => { if (es.some(e => e.isIntersecting) && n < 60) more(); }).observe(document.getElementById('sentinel'));
+}
+window.addEventListener('scroll', () => { if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 50 && n < 60) more(); });
+</script></body></html>

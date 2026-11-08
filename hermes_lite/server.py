@@ -44,26 +44,35 @@ def _ctx_setting(cfg: Config) -> str | int:
 
 
 def ladder_for(cfg: Config) -> list[dict]:
-    """Context first, then micro-batch: keep the micro-batch you chose (prefill speed) and find
-    the largest context that fits beside it; only below 32k context does the micro-batch shrink.
-    ctx_size: auto starts the search at 128k."""
+    """The settings tried, in order, until llama-server loads and runs a full-size prompt.
+
+    The micro-batch is never changed: it sets how fast prompts are read, and a smaller one makes
+    every prefill slower. Only the context gives way, 1k at a time — a failed try dies within a
+    second or two, before any work, and the setting that works is saved for later launches.
+    ctx_size: auto starts at 128k and comes down in bigger steps first."""
     s = cfg["server"]
     ub = _user_ubatch(cfg)
     want = _ctx_setting(cfg)
+    step = 1024
     if want == "auto":
-        ctxs = list(AUTO_CONTEXTS)
+        top = AUTO_CONTEXTS[0]
+        ctxs = [c for c in AUTO_CONTEXTS if c > 65536] + list(range(65536, 16383, -step))
     else:
-        ctxs = [want] + [c for c in (49152, 40960, 32768) if c < want]
-    rungs: list[dict] = [{"label": f"{c // 1024}k context, micro-batch {ub}", "ctx": c} for c in ctxs]
-    rungs[0]["label"] += " (your settings)" if want != "auto" else ""
+        top = want
+        floor = max(16384, (want // 2) // step * step)
+        ctxs = [want] + [c for c in range((want - 1) // step * step, floor - 1, -step) if c < want]
+    rungs: list[dict] = [{"label": f"{c:,}-token context, micro-batch {ub}", "ctx": c} for c in ctxs]
+    if want != "auto":
+        rungs[0]["label"] += " (your settings)"
     smallest = ctxs[-1]
-    u = ub
-    while u > 128:
-        u //= 2
-        rungs.append({"label": f"{smallest // 1024}k context, micro-batch {u}", "ctx": smallest, "ub": u})
     if int(s.get("n_cpu_moe", 38)) < 99:
-        rungs.append({"label": f"all experts on CPU, {smallest // 1024}k context, micro-batch 128",
-                      "n_cpu_moe": 99, "ub": 128, "ctx": smallest})
+        rungs.append({"label": f"all experts on CPU, {smallest:,}-token context, micro-batch {ub}",
+                      "n_cpu_moe": 99, "ctx": smallest})
+    if _supports(str(s.get("binary", "llama-server")), "--fit"):
+        # last resort: no -ngl / --n-cpu-moe, so llama.cpp's own fitting decides what goes on the GPU
+        rungs.append({"label": f"llama.cpp places the layers itself (--fit), {smallest:,}-token context, "
+                               f"micro-batch {ub}", "auto_fit": True, "ctx": smallest})
+    del top
     return rungs
 
 
@@ -89,6 +98,30 @@ RAM_WARNINGS: list[str] = []
 
 def _mem_total() -> int:
     return int(oscompat.meminfo().get("MemTotal", 0))
+
+
+def _apps_ram() -> int:
+    """RAM your desktop and apps use right now, in bytes (0 when unknown). Not the page cache: a
+    memory-mapped model shows up there, so system monitors leave it out of "used". Not llama-server
+    either: its own buffers are planned anew when it starts."""
+    mi = oscompat.meminfo()
+    total, avail = int(mi.get("MemTotal", 0)), int(mi.get("MemAvailable", 0))
+    if not total or not avail:
+        return 0
+    used = total - avail
+    if oscompat.IS_LINUX:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                if Path(f"/proc/{entry}/comm").read_text().strip() != "llama-server":
+                    continue
+                for line in Path(f"/proc/{entry}/status").read_text().splitlines():
+                    if line.startswith("RssAnon:"):
+                        used -= int(line.split()[1]) * 1024
+            except (OSError, ValueError, IndexError):
+                continue
+    return max(0, used)
 
 
 @functools.lru_cache(maxsize=8)
@@ -142,8 +175,7 @@ def build_command(cfg: Config, rung: int = 0) -> list[str]:
         "-m", str(Path(s["model_path"]).expanduser()),
         "--host", str(s.get("host", "127.0.0.1")),
         "--port", str(s.get("port", 8091)),
-        "-ngl", str(s.get("gpu_layers", 99)),
-        "--n-cpu-moe", str(n_cpu_moe),
+        *([] if step.get("auto_fit") else ["-ngl", str(s.get("gpu_layers", 99)), "--n-cpu-moe", str(n_cpu_moe)]),
         "-c", str(ctx),
         "-fa", str(s.get("flash_attn", "on")),
         "-ctk", str(s.get("cache_type_k", "q8_0")),
@@ -158,6 +190,13 @@ def build_command(cfg: Config, rung: int = 0) -> list[str]:
                          "remove them — this config is the non-MTP baseline.")
     if "ub" in step:
         extra = _strip_flag(extra, "-ub", "--ubatch-size") + ["-ub", str(step["ub"])]
+    if step.get("auto_fit"):
+        extra = _strip_flag(extra, "-ngl", "--gpu-layers", "--n-gpu-layers", "--n-cpu-moe", "-ncmoe", "--fit") + ["--fit", "on"]
+    elif not ({"--fit", "-fit"} & set(extra)) and _supports(str(s.get("binary", "llama-server")), "--fit"):
+        # Hermes Lite sets the layer split itself. llama.cpp's pre-check would then keep ~1 GiB of the
+        # GPU free as a margin (a quarter of a 4 GB card) and refuse settings that do fit: let the real
+        # allocation decide; if memory truly runs out, the fallback steps take over.
+        extra += ["--fit", "off"]
     extra = _preload_guard(cfg, extra)
     # One conversation at a time: a single slot keeps the whole cache in one place (with several,
     # a request can land on a slot that doesn't hold the system prompt and read it all again).
@@ -188,30 +227,58 @@ def _warn(msg: str) -> None:
         RAM_WARNINGS.append(msg)
 
 
-def ram_plan(cfg: Config) -> tuple[int, Path | None, bool]:
-    """(prompt-cache MiB, vision encoder file or None, encoder on GPU?) that fit this computer's RAM.
-    Budget = total RAM - model file - server.ram_desktop_gib (your desktop and apps)."""
+ENCODER_WORK = GIB // 2   # rough: the encoder's working memory for one image, on top of its file
+RAM_MARGIN = GIB // 2
+
+
+def ram_budget(cfg: Config) -> dict | None:
+    """What the RAM holds: total, your apps (measured now, at least server.ram_desktop_gib), the model
+    and what is left for the extras. None when unknown (no model file or no /proc/meminfo)."""
     s = cfg["server"]
-    want_cram = int(s.get("cache_ram_mib", 512) or 0)
-    mm = find_mmproj(cfg)
-    on_gpu = bool(s.get("mmproj_offload", True))
     total = _mem_total()
     try:
         model = Path(s["model_path"]).expanduser().stat().st_size
     except OSError:
-        return want_cram, mm, on_gpu
+        return None
     if not total:
+        return None
+    apps = max(_apps_ram(), int(float(s.get("ram_desktop_gib", 5)) * GIB))
+    return {"total": total, "apps": apps, "model": model, "spare": total - apps - model - RAM_MARGIN}
+
+
+def ram_plan(cfg: Config) -> tuple[int, Path | None, bool]:
+    """(prompt-cache MiB, vision encoder file or None, encoder on GPU?) that fit this computer's RAM.
+    The model must stay in RAM: when it does not fit, Linux drops parts of it and reads them back from
+    disk on every prompt, and prompt reading stalls. So the extras only get what is really left."""
+    s = cfg["server"]
+    want_cram = int(s.get("cache_ram_mib", 512) or 0)
+    mm = find_mmproj(cfg)
+    on_gpu = vision_device(cfg) == "vram"
+    b = ram_budget(cfg)
+    if not b:
         return want_cram, mm, on_gpu
-    spare = total - model - float(s.get("ram_desktop_gib", 5)) * GIB
-    need_mm = mm.stat().st_size if (mm and not on_gpu) else 0
+    spare, g = b["spare"], (lambda n: f"{n / GIB:.1f} GB")
+    if spare < 0:
+        _warn(f"The model ({g(b['model'])}) does not fit in the RAM your apps leave free ({g(b['apps'])} of "
+              f"{g(b['total'])} in use): Linux will drop parts of it and read them back from disk, so prompt "
+              "reading can stall for minutes. Close apps or use a smaller quant.")
+    need_mm = (mm.stat().st_size + ENCODER_WORK) if (mm and not on_gpu) else 0
     if need_mm and spare - need_mm < 0:
-        _warn(f"The vision encoder would need {need_mm / GIB:.1f} GB of RAM that the model and your desktop "
-              "need; running it on the GPU instead.")
-        on_gpu, need_mm = True, 0
+        # in RAM it would push the model out (stalls); on the GPU it would cost context: neither silently
+        _warn(f"Vision is off for this run: the encoder needs about {g(need_mm)} of RAM and only "
+              f"{g(max(spare, 0))} is left after the model ({g(b['model'])}) and your apps ({g(b['apps'])}). "
+              "Close apps, then /vision ram again — or /vision vram (costs context), or a smaller model.")
+        mm, need_mm = None, 0
     cram = max(0, min(want_cram, int((spare - need_mm) / (1024 ** 2))))
     if cram < want_cram:
         _warn(f"Prompt cache in RAM lowered to {cram} MB (from {want_cram}) so the model stays in RAM.")
     return cram, mm, on_gpu
+
+
+def vision_device(cfg: Config) -> str:
+    """server.mmproj_device: "vram" (GPU, the default) or "ram" (CPU)."""
+    d = str(cfg["server"].get("mmproj_device", "vram") or "vram").strip().lower()
+    return "ram" if d in ("ram", "cpu") else "vram"
 
 
 def find_mmproj(cfg: Config) -> Path | None:
@@ -269,6 +336,8 @@ class LlamaServer:
         self.script = logs / "run-llama-server.sh"
         self.tuning_file = logs / "server-tuning.json"
         self.exitfile = logs / "llama-server.exit"
+        self.ownerfile = logs / "run-llama-server.owner"   # PID of the launch script that owns these files
+        self._launches = 0
         self.owned = False
         self.status = "down"  # down | starting | loading | tuning | ready | error
         self.error = ""
@@ -349,7 +418,19 @@ class LlamaServer:
 
     def _memory_crash(self) -> bool:
         tail = self.log_tail(80).lower()
-        return any(marker in tail for marker in MEMORY_ERRORS)
+        if any(marker in tail for marker in MEMORY_ERRORS):
+            return True
+        # When a GPU allocation fails, llama.cpp aborts at once and its last log lines (the error) are
+        # often lost: its log is written by a background thread that never gets to flush. So a death
+        # before "model loaded" with no error in the log, or by abort/kill, is treated the same way.
+        try:
+            code = int(self.exitfile.read_text().strip())
+        except (OSError, ValueError):
+            code = None
+        loaded = "model loaded" in tail or "listening on" in tail
+        logged_error = any(f" {lvl} " in line for line in tail.splitlines()[-15:] for lvl in ("e", "f")) or \
+            "error" in "\n".join(tail.splitlines()[-5:])
+        return not loaded and (code in (134, 137, 139, -6, -9, -11) or not logged_error)
 
     # ── health ───────────────────────────────────────────────
     async def health(self) -> str:
@@ -381,14 +462,18 @@ class LlamaServer:
     def _write_script(self) -> None:
         cmd = build_command(self.cfg, self.rung)
         quoted = " ".join(shlex.quote(c) for c in cmd)
+        own = shlex.quote(str(self.ownerfile))
         self.script.write_text(f"""#!/usr/bin/env bash
+echo $$ > {own}
 printf '\\033]0;llama-server · Hermes Lite\\007'
-rm -f {shlex.quote(str(self.stopflag))}
+rm -f {shlex.quote(str(self.stopflag))} {shlex.quote(str(self.exitfile))}
 echo "☤ Hermes Lite — llama-server"
 echo {shlex.quote("$ " + quoted)}
 echo
 bash -c 'echo $$ > {shlex.quote(str(self.pidfile))}; exec "$@"' _ {quoted} 2>&1 | tee {shlex.quote(str(self.logfile))}
 code=${{PIPESTATUS[0]}}
+# a newer launch owns the pid/exit files now (a restart): leave them alone
+[ "$(cat {own} 2>/dev/null)" = "$$" ] || exit 0
 rm -f {shlex.quote(str(self.pidfile))}
 echo "$code" > {shlex.quote(str(self.exitfile))}
 if [ -e {shlex.quote(str(self.stopflag))} ]; then rm -f {shlex.quote(str(self.stopflag))}; exit 0; fi
@@ -398,6 +483,21 @@ read -r _
 """, encoding="utf-8")
         self.script.chmod(0o755)
 
+    def _wait_old_script(self) -> None:
+        """The previous launch script finishes after its llama-server exits (it records the exit code).
+        Starting the next one before that let the old script delete the new server's pid file and
+        report it dead: a restart then stopped instead. Wait for it (3 s at most), then end it."""
+        try:
+            old = int(self.ownerfile.read_text().strip())
+        except (OSError, ValueError):
+            return
+        for _ in range(60):
+            if not oscompat.pid_alive(old):
+                return
+            time.sleep(0.05)
+        if self.pid() is None:   # its server is gone: it is only waiting at "Press Enter"
+            oscompat.terminate(old)
+
     def launch(self) -> None:
         s = self.cfg["server"]
         model = Path(s["model_path"]).expanduser()
@@ -405,6 +505,8 @@ read -r _
             raise FileNotFoundError(f"Model not found: {model}  (set server.model_path in {self.cfg['_path']})")
         if not shutil.which(s.get("binary", "llama-server")):
             raise FileNotFoundError(f"'{s.get('binary')}' is not on PATH (set server.binary in {self.cfg['_path']})")
+        self._wait_old_script()
+        self._launches += 1
         self.logfile.write_text("")
         self.exitfile.unlink(missing_ok=True)
         if not oscompat.IS_LINUX:
@@ -419,25 +521,10 @@ read -r _
             self.owned = True
             self.status = "starting"
             return
+        # a plain window, placed by your window manager (class / app id "hermes-lite-server" where the terminal allows)
         argv = _terminal_argv(s.get("terminal", "auto"), "llama-server", self.script)
-        rules = str(s.get("hyprland_rules") or "").strip()
-        if rules == "auto":  # keep focus on Hermes: open the server on a hidden scratchpad workspace
-            rules = "workspace special:llama silent"
-        launched = False
-        if rules and rules != "none" and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
-            # Classic hyprlang syntax. Lua-configured Hyprland rejects it ("hl.dispatch" error):
-            # then fall back to a plain window, placed by the user's own window rules.
-            line = " ".join(shlex.quote(a) for a in argv)
-            try:
-                r = subprocess.run(["hyprctl", "dispatch", "exec", f"[{rules}] {line}"],
-                                   capture_output=True, text=True, timeout=5)
-                out = (r.stdout + r.stderr).strip().lower()
-                launched = r.returncode == 0 and "error" not in out and "expected" not in out
-            except (OSError, subprocess.SubprocessError):
-                launched = False
-        if not launched:
-            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
         self.owned = True
         self.status = "starting"
 
@@ -455,8 +542,12 @@ read -r _
             log.close()
         self.pidfile.write_text(str(proc.pid))
 
+        launch = self._launches
+
         def watch() -> None:  # what the bash script does on Linux: record the exit code
             code = proc.wait()
+            if launch != self._launches:   # restarted since: these files belong to the new server
+                return
             self.pidfile.unlink(missing_ok=True)
             self.exitfile.write_text(str(code))
             self.stopflag.unlink(missing_ok=True)
@@ -621,13 +712,18 @@ read -r _
                 report("tuning", f"out of GPU memory with {self.rung_label()}, which worked before — retrying once")
                 await asyncio.sleep(3)
                 continue
-            report("tuning", f"out of GPU memory with {self.rung_label()} — trying safer settings")
+            report("tuning", f"out of GPU memory with {self.rung_label()} — trying 1k less context")
             self.trusted, retried = False, False
             self.rung += 1
         self.rung = len(self.ladder) - 1
-        self.error = ("llama-server ran out of GPU memory even with every expert on the CPU, a 128 micro-batch "
-                      "and a 32k context. Something else may be using the GPU (check nvidia-smi).\n"
-                      + self.log_tail())
+        try:
+            code = self.exitfile.read_text().strip()
+        except OSError:
+            code = "?"
+        self.error = (f"llama-server would not start even with a {self.ladder[-1].get('ctx', 0):,}-token context "
+                      f"(last exit code {code}). Either something else is using the GPU (check nvidia-smi), or "
+                      f"this model file is the problem rather than its size: try it once by hand with "
+                      f"hermes-lite --print-server-cmd, or go back to the previous model.\n" + self.log_tail())
         report("error", self.error)
         return False
 

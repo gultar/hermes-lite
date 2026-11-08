@@ -144,3 +144,14 @@ ModalScreen { align: center middle; background: #0d1018 70%; }
 .dialog-code-scroll { height: auto; max-height: 60vh; margin-bottom: 1; }
 .dialog-code-scroll .dialog-code { margin-bottom: 0; }
 .dialog-keys { color: #7d8399; }
+
+/* skills catalogue */
+.skillbrowser { width: 140; height: 85%; }
+.skillbrowser Input { background: #161b29; margin-bottom: 1; }
+.skillbrowser-body { height: 1fr; }
+#skill-list { width: 62; height: 1fr; background: #161b29; }
+#skill-preview-scroll { width: 1fr; height: 1fr; padding: 0 0 0 2; }
+#skill-preview { color: #f1ecdf; }
+#skill-status { height: 1; margin-top: 1; }
+
+.hidden { display: none; }

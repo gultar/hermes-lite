@@ -144,6 +144,8 @@ class Agent:
 
     async def shutdown(self) -> None:
         kill_all(self.ctx)
+        from .tools import browser
+        await asyncio.to_thread(browser.close_for, self.ctx)   # its own Lightpanda / Chromium
         await self.llm.aclose()
         import shutil  # GitHub files kept for this session only
         shutil.rmtree(self.home / "scratch" / self.session_id / "github", ignore_errors=True)
@@ -667,6 +669,7 @@ class Agent:
                     think_budget = int(guard.get("retry_budget", 2048))
                     continue
                 if turn.interrupted:
+                    self._retire_images(turn)   # never send an image twice, even after Esc
                     if turn.content.strip():
                         self.messages.append({"role": "assistant", "content": turn.content + "\n\n[interrupted]"})
                     self.ui.event("interrupted")

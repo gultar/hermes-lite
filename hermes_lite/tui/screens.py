@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import Optional
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -125,20 +126,23 @@ class SecretScreen(ModalScreen[tuple]):
     """Masked password box for sudo. The answer goes to sudo only, never to the model."""
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, prompt: str, command: str):
+    def __init__(self, prompt: str, command: str, placeholder: str = "", remember: Optional[str] = None,
+                 send: str = ""):
         super().__init__()
         self.prompt, self.command = prompt, command
+        self.placeholder = placeholder or "Your password (hidden; goes to sudo only, never to the model)"
+        self.remember = "Remember until Hermes Lite quits (kept in memory only)" if remember is None else remember
+        self.send = send or "Send to sudo"
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog secret"):
             yield Label(self.prompt or "Password:", classes="dialog-title", markup=False)
             if self.command:
                 yield Static(self.command, classes="dialog-code", markup=False)
-            yield Input(password=True, placeholder="Your password (hidden; goes to sudo only, never to the model)",
-                        id="secret")
-            yield Checkbox("Remember until Hermes Lite quits (kept in memory only)", id="remember")
+            yield Input(password=True, placeholder=self.placeholder, id="secret")
+            yield Checkbox(self.remember, id="remember", classes="" if self.remember else "hidden")
             with Horizontal(classes="dialog-buttons"):
-                yield Button("Send to sudo", id="ok", variant="primary")
+                yield Button(self.send, id="ok", variant="primary")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
@@ -155,3 +159,78 @@ class SecretScreen(ModalScreen[tuple]):
 
     def action_cancel(self) -> None:
         self.dismiss((None, False))
+
+
+class SkillBrowser(ModalScreen[list]):
+    """/skills browse: search the catalogue, read a skill, Enter adds it (or removes one you added)."""
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, entries: list[dict], toggle):
+        super().__init__()
+        self.entries, self.toggle, self.changes = entries, toggle, []
+        self.shown: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog skillbrowser"):
+            yield Label(f"Skills catalogue · {len(self.entries)} skills · Enter adds / removes · Esc closes",
+                        classes="dialog-title")
+            yield Input(placeholder="Search: name, category or words from the description", id="skill-search")
+            with Horizontal(classes="skillbrowser-body"):
+                yield OptionList(id="skill-list")
+                with VerticalScroll(id="skill-preview-scroll"):
+                    yield Static("", id="skill-preview", markup=False)
+            yield Static("", id="skill-status", classes="dialog-keys", markup=False)
+
+    def on_mount(self) -> None:
+        self._fill("")
+        self.query_one("#skill-search", Input).focus()
+
+    def _label(self, e: dict) -> str:
+        mark = "✓" if e["added"] else "⚠" if e["hints"] else " "
+        return f"{mark} {e['name'][:34]:<34} {e['category'][:22]}"
+
+    def _fill(self, query: str) -> None:
+        from ..skillcatalog import matches
+        self.shown = [e for e in self.entries if matches(e, query)]
+        ol = self.query_one("#skill-list", OptionList)
+        ol.clear_options()
+        ol.add_options([Option(self._label(e), id=str(i)) for i, e in enumerate(self.shown)])
+        if self.shown:
+            ol.highlighted = 0
+            self._preview(self.shown[0])
+        else:
+            self.query_one("#skill-preview", Static).update("No skill matches.")
+        self.query_one("#skill-status", Static).update(
+            f"{len(self.shown)} shown · ✓ added · ⚠ may need tools Hermes Lite lacks · Tab: list ↔ search")
+
+    def _preview(self, e: dict) -> None:
+        lines = [e["name"], e["description"], f"{e['category']} · {e['dir']}"]
+        if e["hints"]:
+            lines.append("⚠ " + "; ".join(e["hints"]))
+        lines.append("✓ added (Enter removes it)" if e["removable"] else "✓ already in your skills" if e["added"]
+                     else "Enter adds it to ~/.hermes-lite/skills")
+        body = e["body"].strip().splitlines()
+        lines += ["", *body[:80], *(["", f"… {len(body) - 80} more lines"] if len(body) > 80 else [])]
+        self.query_one("#skill-preview", Static).update("\n".join(lines))
+        self.query_one("#skill-preview-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self._fill(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.query_one("#skill-list", OptionList).focus()
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option.id is not None:
+            self._preview(self.shown[int(event.option.id)])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        e = self.shown[int(event.option.id)]
+        message = self.toggle(e)          # adds or removes; returns what happened
+        self.changes.append(message)
+        self.query_one("#skill-list", OptionList).replace_option_prompt(event.option.id, self._label(e))
+        self._preview(e)
+        self.query_one("#skill-status", Static).update(message)
+
+    def action_close(self) -> None:
+        self.dismiss(self.changes)

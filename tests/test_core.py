@@ -66,6 +66,7 @@ def test_vision_is_opt_in_on_gpu_and_respects_the_ram_budget(tmp_path, monkeypat
     with open(mm, "wb") as f:
         f.truncate(1024 ** 3)
     monkeypatch.setattr(server, "_mem_total", lambda: 23 * 1024 ** 3)
+    monkeypatch.setattr(server, "_apps_ram", lambda: 0)          # counted as ram_desktop_gib (5 GB)
     monkeypatch.setattr(server, "_supports", lambda b, f: True)
     c = load_config()
     c["server"]["model_path"] = str(model)
@@ -76,10 +77,35 @@ def test_vision_is_opt_in_on_gpu_and_respects_the_ram_budget(tmp_path, monkeypat
     c["server"]["mmproj"] = "auto"
     cmd = server.build_command(c)
     assert cmd[cmd.index("--mmproj") + 1] == str(mm) and "--no-mmproj-offload" not in cmd   # on the GPU
-    c["server"]["mmproj_offload"] = False              # asked for RAM, but RAM has no room: GPU anyway
-    assert "--no-mmproj-offload" not in server.build_command(c)
+    c["server"]["mmproj_device"] = "ram"     # asked for RAM, but it would push the model out: off, said why
+    server.RAM_WARNINGS.clear()
+    cmd = server.build_command(c)
+    assert "--mmproj" not in cmd and any(w.startswith("Vision is off") for w in server.RAM_WARNINGS)
+    assert any("does not fit" in w for w in server.RAM_WARNINGS)       # 17.7 + 5 + margin > 23
+    assert int(cmd[cmd.index("--cache-ram") + 1]) == 0
     monkeypatch.setattr(server, "_mem_total", lambda: 64 * 1024 ** 3)
-    assert "--no-mmproj-offload" in server.build_command(c)   # plenty of RAM: as asked
+    server.RAM_WARNINGS.clear()
+    assert "--no-mmproj-offload" in server.build_command(c) and not server.RAM_WARNINGS
+    # your apps are measured: 12 GB in use on 32 GB with a 20.6 GB model leaves no room for the encoder
+    monkeypatch.setattr(server, "_mem_total", lambda: 31 * 1024 ** 3)
+    monkeypatch.setattr(server, "_apps_ram", lambda: 12 * 1024 ** 3)
+    with open(model, "wb") as f:
+        f.truncate(int(20.6 * 1024 ** 3))
+    assert "--mmproj" not in server.build_command(c)
+    monkeypatch.setattr(server, "_apps_ram", lambda: 7 * 1024 ** 3)    # 7 GB in use: it fits
+    assert "--no-mmproj-offload" in server.build_command(c)
+
+
+def test_older_mmproj_offload_setting_still_works(tmp_path):
+    from hermes_lite.config import load_config
+    from hermes_lite.server import vision_device
+    f = tmp_path / "c.yaml"
+    f.write_text("server:\n  mmproj_offload: false\n")
+    assert vision_device(load_config(str(f))) == "ram"
+    f.write_text("server:\n  mmproj_offload: false\n  mmproj_device: vram\n")   # the new key wins
+    assert vision_device(load_config(str(f))) == "vram"
+    f.write_text("server:\n  port: 8091\n")
+    assert vision_device(load_config(str(f))) == "vram"
 
 
 def test_saved_server_setting_reused_and_survives_command_changes(tmp_path, monkeypatch):

@@ -13,11 +13,15 @@ else
   "$venv/bin/pip" install --quiet -e "$here"
 fi
 
-# Lightpanda: a light headless browser for pages built by JavaScript (optional; Chromium is the fallback)
+# Lightpanda: a light headless browser for pages built by JavaScript (optional; Chromium is the fallback).
+# Playwright: drives Lightpanda or Chromium for the browser tool (clicking, typing); it uses the
+# browsers already installed, it downloads none.
 if command -v uv >/dev/null 2>&1; then
   VIRTUAL_ENV="$venv" uv pip install --quiet lightpanda 2>/dev/null || echo "Lightpanda not installed (optional): JavaScript pages will use Chromium."
+  VIRTUAL_ENV="$venv" uv pip install --quiet playwright 2>/dev/null || echo "Playwright not installed (optional): no browser tool (web_extract still reads pages)."
 else
   "$venv/bin/pip" install --quiet lightpanda 2>/dev/null || echo "Lightpanda not installed (optional): JavaScript pages will use Chromium."
+  "$venv/bin/pip" install --quiet playwright 2>/dev/null || echo "Playwright not installed (optional): no browser tool (web_extract still reads pages)."
 fi
 
 mkdir -p "$HOME/.local/bin"

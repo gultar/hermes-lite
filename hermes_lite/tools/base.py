@@ -27,6 +27,7 @@ class Tool:
     read_only: bool = False          # read-only tools may run concurrently
     label: Callable[[dict], str] = lambda a: ""  # one-line summary for the UI card
     requires: str = ""               # "vision": offered only when the server can take images
+    extra: Optional[Callable[[], str]] = None   # appended to the description: what this computer allows
 
     def openai_schema(self) -> dict:
         """The schema the model sees; its description comes from prompts/tool_<name>.md when present."""
@@ -35,6 +36,8 @@ class Tool:
             description = promptfiles.get(promptfiles.TOOL_PREFIX + self.name)
         except RuntimeError:
             description = self.schema.get("description", "")
+        if self.extra:
+            description = description.rstrip() + " " + self.extra()
         schema = {**self.schema, "description": description}
         short = promptfiles.param_descriptions(self.name)
         props = (schema.get("parameters") or {}).get("properties")

@@ -233,3 +233,28 @@ def test_summary_keeps_latest_read_in_tail(tmp_path):
     assert "code line 200" in _content(a, "key")
     i = next(i for i, m in enumerate(a.messages) if m.get("tool_call_id") == "key")
     assert a.messages[i - 1]["tool_calls"][0]["id"] == "key"          # its call is kept with it
+
+
+def test_esc_after_an_image_never_sends_it_again(tmp_path, monkeypatch):
+    from hermes_lite.llm import ToolCall
+    monkeypatch.setenv("HERMES_LITE_HOME", str(tmp_path / "home"))
+    a = _agent(tmp_path)
+    a.llm.vision = True
+    img = tmp_path / "shot.png"
+    from PIL import Image
+    Image.new("RGB", (8, 8)).save(img)
+    turns = iter([Turn(tool_calls=[ToolCall(id="v1", name="view_image", arguments=json.dumps({"path": str(img)}),
+                                            parsed={"path": str(img)})]),
+                  Turn(content="I see a black squ", interrupted=True)])
+    sent = []
+
+    async def fake(messages, tools, **kw):
+        sent.append(messages)
+        return next(turns)
+    a.llm.stream = fake
+    a.save = lambda: None
+    asyncio.run(a.run("look at shot.png"))
+    assert any(isinstance(m.get("content"), list) for m in sent[1])          # shown once
+    assert not any(m.get("_images") for m in a.messages)                     # then retired, despite Esc
+    note = next(m["content"] for m in a.messages if "removed to save context" in str(m.get("content")))
+    assert "I see a black squ" in note

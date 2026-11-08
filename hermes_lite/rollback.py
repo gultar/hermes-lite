@@ -20,7 +20,8 @@ from pathlib import Path
 from .config import home
 
 PROJECT = Path(__file__).resolve().parent.parent          # editable install: the folder you unzipped
-CODE_ITEMS = ("hermes_lite", "tests", "pyproject.toml", "install.sh", "install.ps1", "README.md")
+CODE_ITEMS = ("hermes_lite", "tests", "pyproject.toml", "install.sh", "install.ps1", "install-offline.sh",
+              "make-bundle.sh", "README.md")
 KEEP_CODE, KEEP_CONFIG = 8, 15
 
 
@@ -129,7 +130,12 @@ def rollback_code(latest: bool = False) -> int:
             shutil.copy2(src, p)
     # reinstall into the same venv so dependencies match that version
     if sys.prefix != sys.base_prefix:  # inside Hermes Lite's venv: match that version's dependencies
-        if shutil.which("uv"):
+        wheels = PROJECT / "vendor" / "wheels"
+        if wheels.is_dir():  # offline bundle: the pinned wheels, nothing from the internet
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-index", "--find-links",
+                            str(wheels), "--no-build-isolation", "-e", str(PROJECT)], check=False,
+                           env={**os.environ, "PYTHONWARNINGS": "ignore"})
+        elif shutil.which("uv"):
             subprocess.run(["uv", "pip", "install", "--quiet", "-e", str(PROJECT)], check=False,
                            env={**os.environ, "VIRTUAL_ENV": sys.prefix})
         else:

@@ -66,65 +66,165 @@ def _attach(ctx: ToolContext, path: Path, label: str, question: str) -> None:
 
 
 # ── screen capture ───────────────────────────────────────────────────────
-def _hypr(*args: str):
-    r = _run(["hyprctl", *args, "-j"], 10)
-    return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+SCREEN_WORDS = ("screen", "monitor", "all", "desktop")
+ACTIVE_WORDS = ("window", "active", "active window", "focused")
 
 
-def _visible_workspaces() -> set[int]:
-    mons = _hypr("monitors") or []
-    ids = {m.get("activeWorkspace", {}).get("id") for m in mons}
-    ids |= {m.get("specialWorkspace", {}).get("id") for m in mons if m.get("specialWorkspace", {}).get("id")}
-    return ids
+class NoWindowCapture(Exception):
+    """This desktop offers no way to capture one window: the whole screen is captured instead."""
 
 
-def _capture_wayland(target: str, raw: Path) -> str | None:
-    """grim (+ hyprctl for windows on Hyprland). Returns an error message or None."""
+def _json(argv: list[str]):
+    r = _run(argv, 10)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return None
+
+
+def _pick(windows: list[dict], target: str) -> dict:
+    """The focused window ("window"), or the first whose title or app id contains *target*."""
+    t = target.strip().lower()
+    if t in ACTIVE_WORDS:
+        hit = next((w for w in windows if w.get("focused")), None)
+        if not hit:
+            raise NoWindowCapture("this desktop does not say which window is focused")
+        return hit
+    hit = next((w for w in windows if t in f"{w.get('app', '')} {w.get('title', '')}".lower()), None)
+    if not hit:
+        names = "; ".join(short(f"{w.get('app')}: {w.get('title')}", 60) for w in windows[:15])
+        raise LookupError(f"No window matches {target!r}. Open windows: {names or '(none listed)'}")
+    return hit
+
+
+# Window lists, each from what the running desktop actually offers (no setting names a desktop):
+# Hyprland's and Sway's IPC give positions (then grim crops the screen); any compositor with the
+# ext-foreign-toplevel-list + ext-image-copy-capture protocols (MangoWM, niri, recent wlroots ones)
+# lets grim (1.5+) capture a window directly, listed by lswt.
+def _hyprland_windows() -> list[dict] | None:
+    if not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl")):
+        return None
+    mons = _json(["hyprctl", "monitors", "-j"]) or []
+    shown = {m.get("activeWorkspace", {}).get("id") for m in mons} | \
+            {m.get("specialWorkspace", {}).get("id") for m in mons if m.get("specialWorkspace", {}).get("id")}
+    active = (_json(["hyprctl", "activewindow", "-j"]) or {}).get("address")
+    return [{"app": c.get("class", ""), "title": c.get("title", ""), "focused": c.get("address") == active,
+             "visible": c.get("workspace", {}).get("id") in shown, "geom": (*c["at"], *c["size"])}
+            for c in _json(["hyprctl", "clients", "-j"]) or [] if c.get("at") and c.get("size")]
+
+
+def _sway_windows() -> list[dict] | None:
+    if not (os.environ.get("SWAYSOCK") and shutil.which("swaymsg")):
+        return None
+    out: list[dict] = []
+
+    def walk(node: dict) -> None:
+        kids = node.get("nodes", []) + node.get("floating_nodes", [])
+        if not kids and node.get("type") in ("con", "floating_con") and node.get("pid"):
+            r = node.get("rect", {})
+            out.append({"app": node.get("app_id") or (node.get("window_properties") or {}).get("class", ""),
+                        "title": node.get("name") or "", "focused": bool(node.get("focused")),
+                        "visible": node.get("visible", True),
+                        "geom": (r.get("x", 0), r.get("y", 0), r.get("width", 0), r.get("height", 0))})
+        for k in kids:
+            walk(k)
+    walk(_json(["swaymsg", "-t", "get_tree"]) or {})
+    return out
+
+
+def _lswt(*extra: str) -> list[dict]:
+    data = _json(["lswt", "-j", *extra])
+    items = data.get("toplevels") if isinstance(data, dict) else data
+    out = []
+    for it in items or []:
+        if isinstance(it, dict):
+            k = {str(key).lower().replace("-", "").replace("_", ""): v for key, v in it.items()}
+            out.append({"app": str(k.get("appid") or ""), "title": str(k.get("title") or ""),
+                        "id": str(k.get("identifier") or ""), "activated": k.get("activated")})
+    return out
+
+
+def _toplevel_windows() -> list[dict] | None:
+    """Windows grim can capture by identifier: ext-foreign-toplevel-list ids (lswt), focus from the wlr
+    protocol where the compositor has it. None when grim or lswt cannot do it here."""
+    if not (shutil.which("lswt") and shutil.which("grim")):
+        return None
+    r = _run(["grim", "-h"], 10)
+    if "-T" not in (r.stdout + r.stderr):     # grim older than 1.5
+        return None
+    tops = _lswt()
+    if not any(t["id"] for t in tops):
+        tops = _lswt("--force-protocol", "ext-foreign-toplevel-list-v1")
+    if not any(t["id"] for t in tops):
+        return None
+    if all(t["activated"] is None for t in tops):   # ids came without focus: ask the wlr protocol for it
+        focus = {(t["app"], t["title"]) for t in
+                 _lswt("--force-protocol", "wlr-foreign-toplevel-management-unstable-v1")
+                 if t["activated"] is True or str(t["activated"]).lower() in ("true", "1", "yes")}
+        for t in tops:
+            t["activated"] = (t["app"], t["title"]) in focus
+    return [{"app": t["app"], "title": t["title"], "focused": bool(t["activated"] is True or
+             str(t["activated"]).lower() in ("true", "1", "yes")), "visible": True, "toplevel": t["id"]}
+            for t in tops if t["id"]]
+
+
+def _capture_window_wayland(target: str, raw: Path) -> str:
+    """Capture one window; returns its label. LookupError: no such window; NoWindowCapture: not
+    possible on this desktop."""
+    if not shutil.which("grim"):
+        raise NoWindowCapture("grim is not installed")
+    for source in (_hyprland_windows, _sway_windows, _toplevel_windows):
+        windows = source()
+        if windows is None:
+            continue
+        w = _pick(windows, target)
+        if not w.get("visible", True):
+            raise LookupError(f"The window {w.get('title')!r} is on a workspace that is not on screen, so it "
+                              "cannot be captured. Ask the user to bring it on screen (it is not moved for them).")
+        argv = (["grim", "-T", w["toplevel"], str(raw)] if w.get("toplevel") else
+                ["grim", "-g", "{},{} {}x{}".format(*w["geom"]), str(raw)])
+        r = _run(argv)
+        if r.returncode != 0 or not raw.exists():
+            raise NoWindowCapture(f"grim could not capture it ({(r.stderr or r.stdout).strip()[:200]})")
+        return f"window {short(w.get('title') or w.get('app') or target, 60)!r}"
+    raise NoWindowCapture("this desktop gives no window list (for MangoWM, niri and other wlroots-style "
+                          "compositors: install lswt and grim 1.5 or newer)")
+
+
+def _capture_screen_wayland(raw: Path) -> str | None:
     if not shutil.which("grim"):
         return "grim is not installed (sudo pacman -S grim)."
-    geom = None
-    t = target.strip().lower()
-    hypr = bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and shutil.which("hyprctl")
-    if t in ("window", "active", "active window", "focused"):
-        if not hypr:
-            return "Capturing the active window needs Hyprland; use target='screen'."
-        w = _hypr("activewindow")
-        if not w or not w.get("size"):
-            return "No active window."
-        geom = w
-    elif t not in ("screen", "monitor", "all", "desktop"):
-        if not hypr:
-            return "Capturing a window by name needs Hyprland; use target='screen'."
-        clients = _hypr("clients") or []
-        match = [c for c in clients if t in (c.get("class", "") + " " + c.get("title", "")).lower()]
-        if not match:
-            names = "; ".join(short(f"{c.get('class')}: {c.get('title')}", 60) for c in clients[:15])
-            return f"No window matches {target!r}. Open windows: {names}"
-        visible = _visible_workspaces()
-        shown = [c for c in match if c.get("workspace", {}).get("id") in visible]
-        if not shown:
-            ws = match[0].get("workspace", {}).get("name")
-            return (f"The window {match[0].get('title')!r} is on workspace {ws}, which is not on screen, so it "
-                    "cannot be captured. Ask the user to bring it on screen (it is not moved for them).")
-        geom = shown[0]
-    if geom:
-        (x, y), (w, h) = geom["at"], geom["size"]
-        argv = ["grim", "-g", f"{x},{y} {w}x{h}", str(raw)]
-    elif hypr:
-        mon = next((m for m in (_hypr("monitors") or []) if m.get("focused")), None)
-        argv = ["grim", "-o", mon["name"], str(raw)] if mon else ["grim", str(raw)]
-    else:
-        argv = ["grim", str(raw)]
+    argv = ["grim", str(raw)]
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):   # just the focused monitor
+        mon = next((m for m in (_json(["hyprctl", "monitors", "-j"]) or []) if m.get("focused")), None)
+        argv = ["grim", "-o", mon["name"], str(raw)] if mon else argv
+    elif os.environ.get("SWAYSOCK") and shutil.which("swaymsg"):
+        mon = next((o for o in (_json(["swaymsg", "-t", "get_outputs"]) or []) if o.get("focused")), None)
+        argv = ["grim", "-o", mon["name"], str(raw)] if mon else argv
     r = _run(argv)
     return None if r.returncode == 0 and raw.exists() else f"grim failed: {(r.stderr or r.stdout).strip()[:300]}"
 
 
-def _capture_x11(target: str, raw: Path) -> str | None:
-    t = target.strip().lower()
-    if t in ("window", "active", "focused") and shutil.which("import") and shutil.which("xdotool"):
+def _capture_window_x11(target: str, raw: Path) -> str:
+    if not shutil.which("xdotool") or not (shutil.which("import") or shutil.which("maim")):
+        raise NoWindowCapture("xdotool and imagemagick (or maim) are needed for one window")
+    t = target.strip()
+    if t.lower() in ACTIVE_WORDS:
         wid = _run(["xdotool", "getactivewindow"]).stdout.strip()
-        r = _run(["import", "-window", wid, str(raw)])
-    elif shutil.which("maim"):
+    else:
+        wid = (_run(["xdotool", "search", "--onlyvisible", "--name", t]).stdout.split() or [""])[0]
+        if not wid:
+            raise LookupError(f"No visible window matches {target!r}.")
+    r = _run(["import", "-window", wid, str(raw)] if shutil.which("import") else ["maim", "-i", wid, str(raw)])
+    if r.returncode != 0 or not raw.exists():
+        raise NoWindowCapture(f"capture failed: {(r.stderr or r.stdout).strip()[:200]}")
+    return "the active window" if t.lower() in ACTIVE_WORDS else f"window {t!r}"
+
+
+def _capture_screen_x11(raw: Path) -> str | None:
+    if shutil.which("maim"):
         r = _run(["maim", str(raw)])
     elif shutil.which("scrot"):
         r = _run(["scrot", "-o", str(raw)])
@@ -177,20 +277,42 @@ def _firefox() -> str | None:
     return None
 
 
-def _capture_windows(raw: Path) -> str | None:
-    """The whole virtual screen, through .NET (PowerShell)."""
+def _capture_windows(raw: Path, target: str = "screen") -> str | None:
+    """The whole virtual screen, or one window (the foreground one, or by title or process name),
+    through .NET (PowerShell)."""
     from .. import oscompat
     ps = oscompat.powershell()
     if not ps:
         return "PowerShell not found."
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; "
-        "$b = [System.Windows.Forms.SystemInformation]::VirtualScreen; "
-        "$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height; "
-        "$g = [System.Drawing.Graphics]::FromImage($bmp); "
-        "$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size); "
-        f"$bmp.Save('{str(raw).replace(chr(39), chr(39) * 2)}', [System.Drawing.Imaging.ImageFormat]::Png)")
+    q = lambda v: "'" + str(v).replace("'", "''") + "'"
+    t = target.strip()
+    if t.lower() in SCREEN_WORDS:
+        grab = ("$b = [System.Windows.Forms.SystemInformation]::VirtualScreen; "
+                "$x=$b.Left; $y=$b.Top; $w=$b.Width; $h=$b.Height; ")
+    else:
+        find = ("$hw = [W]::GetForegroundWindow(); " if t.lower() in ACTIVE_WORDS else
+                f"$p = Get-Process | Where-Object {{ $_.MainWindowHandle -ne 0 -and ($_.MainWindowTitle -like "
+                f"('*' + {q(t)} + '*') -or $_.ProcessName -like ('*' + {q(t)} + '*')) }} | Select-Object -First 1; "
+                "if (-not $p) { Write-Error 'NOMATCH'; exit 3 }; $hw = $p.MainWindowHandle; "
+                "[W]::ShowWindow($hw, 9) | Out-Null; [W]::SetForegroundWindow($hw) | Out-Null; Start-Sleep -Milliseconds 300; ")
+        grab = ("Add-Type @'\nusing System; using System.Runtime.InteropServices;\npublic class W {\n"
+                "[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();\n"
+                "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n"
+                "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c);\n"
+                "[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();\n"
+                "[DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr h, out RECT r);\n"
+                "public struct RECT { public int Left, Top, Right, Bottom; } }\n'@\n"
+                "[W]::SetProcessDPIAware() | Out-Null; " + find +
+                "$r = New-Object W+RECT; [W]::GetWindowRect($hw, [ref]$r) | Out-Null; "
+                "$x=$r.Left; $y=$r.Top; $w=$r.Right-$r.Left; $h=$r.Bottom-$r.Top; ")
+    script = ("Add-Type -AssemblyName System.Windows.Forms, System.Drawing; " + grab +
+              "$bmp = New-Object System.Drawing.Bitmap $w, $h; "
+              "$g = [System.Drawing.Graphics]::FromImage($bmp); "
+              "$g.CopyFromScreen($x, $y, 0, 0, $bmp.Size); "
+              f"$bmp.Save({q(raw)}, [System.Drawing.Imaging.ImageFormat]::Png)")
     r = _run([ps, "-NoProfile", "-NonInteractive", "-Command", script], 30)
+    if "NOMATCH" in (r.stderr or ""):
+        raise LookupError(f"No window matches {target!r} (title or program name).")
     return None if raw.exists() else f"Screen capture failed: {(r.stderr or r.stdout).strip()[:300]}"
 
 
@@ -233,25 +355,44 @@ def screenshot(args: dict, ctx: ToolContext) -> str:
     question = str(args.get("look_for") or "").strip()
     raw = _image_dir(ctx) / f"raw-{int(time.time() * 1000)}.png"
     if target.startswith(("http://", "https://", "file://")) or target.startswith("localhost"):
+        note = ""
         url = target if "://" in target else "http://" + target
         err = _capture_url(url, raw, int(args.get("width") or 1280), int(args.get("height") or 800),
                            int(args.get("wait_ms") or 2500))
         label = f"web page {url}"
-    elif os.name == "nt" or sys.platform == "darwin":
-        if target.lower() not in ("screen", "monitor", "all", "desktop", "window", "active", "focused"):
-            return error("On this system only the whole screen (target='screen') or a web page URL can be captured.")
-        err = _capture_windows(raw) if os.name == "nt" else _capture_mac(raw)
-        label = "the screen"
-    elif os.environ.get("WAYLAND_DISPLAY"):
-        err = _capture_wayland(target, raw)
-        label = "the active window" if target.lower() in ("window", "active", "focused") else (
-            "the screen" if target.lower() in ("screen", "monitor", "all", "desktop") else f"window {target!r}")
-    elif os.environ.get("DISPLAY"):
-        err = _capture_x11(target, raw)
-        label = "the active window" if target.lower() in ("window", "active", "focused") else "the screen"
     else:
-        err = "No graphical session (neither WAYLAND_DISPLAY nor DISPLAY is set)."
-        label = ""
+        err, label, note = None, "the screen", ""
+        t = target.lower()
+        try:
+            if t in SCREEN_WORDS:
+                raise NoWindowCapture("")
+            if os.name == "nt":
+                err = _capture_windows(raw, target)
+                label = "the active window" if t in ACTIVE_WORDS else f"window {target!r}"
+            elif sys.platform == "darwin":
+                raise NoWindowCapture("macOS window capture is not supported yet")
+            elif os.environ.get("WAYLAND_DISPLAY"):
+                label = _capture_window_wayland(target, raw)
+            elif os.environ.get("DISPLAY"):
+                label = _capture_window_x11(target, raw)
+            else:
+                err = "No graphical session (neither WAYLAND_DISPLAY nor DISPLAY is set)."
+        except LookupError as exc:
+            return error(str(exc))
+        except NoWindowCapture as exc:   # the whole screen instead, and say why
+            note = (f"One window could not be captured here ({exc}): this is the whole screen. "
+                    if str(exc) else "")
+            label = "the screen"
+            if os.name == "nt":
+                err = _capture_windows(raw)
+            elif sys.platform == "darwin":
+                err = _capture_mac(raw)
+            elif os.environ.get("WAYLAND_DISPLAY"):
+                err = _capture_screen_wayland(raw)
+            elif os.environ.get("DISPLAY"):
+                err = _capture_screen_x11(raw)
+            else:
+                err = "No graphical session (neither WAYLAND_DISPLAY nor DISPLAY is set)."
     if err:
         return error(err)
     try:
@@ -260,7 +401,7 @@ def screenshot(args: dict, ctx: ToolContext) -> str:
         raw.unlink(missing_ok=True)
     _attach(ctx, path, f"screenshot of {label}", question)
     return ok(success=True, image=str(path), size=size, shows=label,
-              note="The screenshot is attached right after these tool results. You see it ONCE: in your next "
+              note=note + "The screenshot is attached right after these tool results. You see it ONCE: in your next "
                    "reply, write down everything in it that matters for the task (text, values, layout, errors) "
                    "before anything else — afterwards it is replaced by those notes.")
 
@@ -286,16 +427,39 @@ def view_image(args: dict, ctx: ToolContext) -> str:
                    "is replaced by those notes.")
 
 
+def window_capture_available() -> bool:
+    """Can one window be captured here? (Checked from what is installed and running, not a setting.)"""
+    if os.name == "nt":
+        return True
+    if sys.platform == "darwin":
+        return False
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return bool(shutil.which("grim")) and bool(
+            (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"))
+            or (os.environ.get("SWAYSOCK") and shutil.which("swaymsg")) or shutil.which("lswt"))
+    return bool(os.environ.get("DISPLAY") and shutil.which("xdotool") and (shutil.which("import") or shutil.which("maim")))
+
+
+def _window_note() -> str:
+    """Added to the screenshot description (after prompts/tool_screenshot.md): what this desktop allows."""
+    if window_capture_available():
+        return ("It can also capture one window by name (its title or app name, e.g. 'firefox'), or 'window' "
+                "for the focused one; only windows on screen, not on hidden workspaces.")
+    return "On this desktop one window cannot be captured: use 'screen' or a URL."
+
+
+def _screenshot_description() -> str:
+    return ("Take a screenshot and look at it: the screen the user is on (default), or a web page rendered "
+            "headless from a URL (http://localhost:3000 — best for checking a web app you are building: no need "
+            "for the user's browser). The image is shown to you once, after this call; note what you see in your "
+            "next reply.")
+
+
 LOOK = {"type": "string", "description": "What to check in the image (e.g. 'is the login form visible, any error text?')."}
 
 register(Tool(
     name="screenshot", emoji="📸", requires="vision",
-    schema={"name": "screenshot", "description": (
-        "Take a screenshot and look at it: the screen the user is on (default), a window by name (its title or "
-        "app class, e.g. 'firefox', 'Strategy Game'), or a web page rendered headless from a URL "
-        "(http://localhost:3000 — best for checking a web app you are building: no need for the user's "
-        "browser). The image is shown to you once, after this call; note what you see in your next reply. "
-        "Only the user's visible screen can be captured — windows on hidden workspaces cannot."),
+    schema={"name": "screenshot", "description": _screenshot_description(),
         "parameters": {"type": "object", "properties": {
             "target": {"type": "string", "description": "'screen', a window name, or a URL. ('window' = the "
                        "focused window, usually the terminal you run in.)", "default": "screen"},
@@ -304,7 +468,7 @@ register(Tool(
             "height": {"type": "integer", "description": "Viewport height for a URL (default 800)."},
             "wait_ms": {"type": "integer", "description": "For a URL: let scripts run this long first (default 2500)."},
         }, "required": []}},
-    handler=screenshot, label=lambda a: short(a.get("target") or "screen", 70),
+    handler=screenshot, label=lambda a: short(a.get("target") or "screen", 70), extra=_window_note,
 ))
 
 register(Tool(

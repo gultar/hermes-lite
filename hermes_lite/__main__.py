@@ -27,6 +27,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="this run with the built-in prompts, ignoring your copies in ~/.hermes-lite/prompts")
     p.add_argument("--hermes-prompts", action="store_true",
                    help="this run with the original Hermes prompt wording (same as prompts.style: hermes)")
+    p.add_argument("--telegram", action="store_true",
+                   help="run with no TUI: talk to Hermes Lite from Telegram only (pairs your account first)")
     p.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE", default=[],
                    help="change one setting in config.yaml and exit (repeatable), e.g. --set server.port=8080")
     p.add_argument("--give-back", action="store_true",
@@ -89,12 +91,42 @@ def main(argv: list[str] | None = None) -> int:
             print(f"# fallback setting in use: {srv.rung_label()}  (/server reset in Hermes Lite to retry your own)")
         return 0
 
+    if args.telegram and not _telegram_ready():
+        return 1
     from .tui.app import HermesApp
     app = HermesApp(cfg, cwd=os.path.abspath(os.path.expanduser(args.cwd)),
                     start_server=not args.no_server and cfg.get_path("server.autostart", True),
-                    resume=args.resume)
-    app.run(mouse=not (args.no_mouse or cfg.get_path("ui.mouse", True) is False))
+                    resume=args.resume, telegram=args.telegram, headless=args.telegram)
+    if args.telegram:
+        print("Hermes Lite is running with no TUI: talk to it on Telegram. Ctrl+C quits.", flush=True)
+        app.run(headless=True)
+    else:
+        app.run(mouse=not (args.no_mouse or cfg.get_path("ui.mouse", True) is False))
     return 0
+
+
+def _telegram_ready() -> bool:
+    """--telegram: make sure there is a bot token and a paired account, asking in this terminal."""
+    import asyncio
+    import getpass
+    from . import telegram as tg
+    from .config import home
+    h = home()
+    if not tg.token(h):
+        print("Create a bot with @BotFather in Telegram (/newbot) and paste its token here (hidden).")
+        value = getpass.getpass("Bot token: ").strip()
+        if not tg.TOKEN_RE.match(value):
+            print("That does not look like a bot token.")
+            return False
+        tg.save_state(h, {**tg.load_state(h), "token": value})
+        print(f"Saved in {tg.state_path(h)} (readable only by you).")
+    if not tg.load_state(h).get("owner_id"):
+        try:
+            return asyncio.run(tg.pair_in_terminal(h))
+        except Exception as exc:
+            print(f"Telegram: {exc}")
+            return False
+    return True
 
 
 if __name__ == "__main__":

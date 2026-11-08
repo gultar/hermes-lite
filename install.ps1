@@ -13,6 +13,8 @@ if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
 $vpy = Join-Path $venv 'Scripts\python.exe'
 & $vpy -m pip install --quiet --upgrade pip
 & $vpy -m pip install --quiet -e $here
+# Optional: the browser tool (clicking, typing) drives Edge or Chrome through Playwright.
+try { & $vpy -m pip install --quiet playwright } catch { Write-Host 'Playwright not installed (optional): no browser tool.' }
 
 # A small launcher in a folder that is on PATH by default for every user.
 $bin = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
